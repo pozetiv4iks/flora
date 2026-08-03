@@ -8,6 +8,8 @@ from app.database import Database
 from app.tools.git_tool import GitManager
 from app.tools.code_indexer import CodeIndexer
 from app.tools.browser_tool import WebBrowserTool
+from app.tools.server_tool import ServerTool
+from app.tools.github_tool import GitHubTool
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,8 @@ class FloraBrain:
         self.git = GitManager()
         self.indexer = CodeIndexer()
         self.browser = WebBrowserTool()
+        self.server = ServerTool()
+        self.github = GitHubTool()
 
     def _get_system_prompt(self, user_id: int) -> str:
         """Construct the rich system prompt defining Flora's multi-layered personality."""
@@ -76,7 +80,7 @@ class FloraBrain:
    - Не пишешь код
    - Флиртуешь да и впринципе не пишешь большие сообщения
    - Не используешь markdown
-   
+
 Твоя память о пользователе:
 {user_facts_str}
 
@@ -127,6 +131,21 @@ class FloraBrain:
 
 13. Сохранение информации о стартапе:
     {{"tool": "save_startup_info", "key": "ключ", "value": "значение"}}
+
+14. Выполнение терминальных команд (Shell) на сервере (запуск проектов, управление докером, установка пакетов):
+    {{"tool": "run_command", "command": "команда_shell"}}
+
+15. Генерация SSH-ключа (для привязки к внешним серверам или GitHub):
+    {{"tool": "generate_ssh_key", "key_name": "id_ed25519"}}
+
+16. Отправка инвайта (приглашения) в репозиторий GitHub для коллаборации:
+    {{"tool": "github_invite", "repo_name": "имя_репозитория", "username": "логин_на_github", "permission": "push"}}
+
+17. Добавление публичного SSH-ключа прямо в аккаунт GitHub:
+    {{"tool": "github_add_ssh_key", "title": "название_ключа", "key_content": "публичный_ключ_ssh"}}
+
+18. Создание нового репозитория на GitHub:
+    {{"tool": "github_create_repo", "repo_name": "имя_нового_репозитория", "private": true}}
 
 Правила вызова инструментов:
 - Если пользователь просит тебя выполнить техническое действие (например, склонировать проект, проиндексировать его или отредактировать файл), сначала напиши ему поддерживающий эмпатичный ответ в чат, а в САМОМ КОНЦЕ сообщения добавь ТОЛЬКО ОДИН JSON-блок вызова инструмента. Ничего не пиши после JSON-блока.
@@ -218,6 +237,42 @@ class FloraBrain:
             elif tool_name == "save_startup_info":
                 self.db.set_startup_info(tool_call["key"], tool_call["value"])
                 return json.dumps({"success": True, "message": f"Сохранила информацию о стартапе: {tool_call['key']} = {tool_call['value']}"})
+                
+            elif tool_name == "run_command":
+                res = self.server.run_command(tool_call["command"])
+                if not res.get("success"):
+                    self.db.add_reflection_lesson(
+                        task_name="Run terminal command",
+                        lesson=f"Команда '{tool_call['command']}' завершилась с ошибкой: {res.get('stderr') or res.get('error')}",
+                        success=False
+                    )
+                return json.dumps(res)
+                
+            elif tool_name == "generate_ssh_key":
+                res = self.server.generate_ssh_key(tool_call.get("key_name", "id_ed25519"))
+                return json.dumps(res)
+                
+            elif tool_name == "github_invite":
+                res = await self.github.invite_collaborator(
+                    tool_call["repo_name"], 
+                    tool_call["username"], 
+                    tool_call.get("permission", "push")
+                )
+                return json.dumps(res)
+                
+            elif tool_name == "github_add_ssh_key":
+                res = await self.github.add_ssh_key_to_github(
+                    tool_call["title"], 
+                    tool_call["key_content"]
+                )
+                return json.dumps(res)
+                
+            elif tool_name == "github_create_repo":
+                res = await self.github.create_github_repo(
+                    tool_call["repo_name"], 
+                    tool_call.get("private", True)
+                )
+                return json.dumps(res)
                 
             else:
                 return json.dumps({"success": False, "error": f"Unknown tool: {tool_name}"})
