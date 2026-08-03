@@ -1,10 +1,11 @@
 FROM python:3.10-slim
 
-# Install base system dependencies (git, curl, and ffmpeg are required)
+# Install base system dependencies (git, curl, ffmpeg, and docker-cli are required)
 RUN apt-get update && apt-get install -y \
     git \
     curl \
     ffmpeg \
+    && curl -fsSL https://get.docker.com | sh \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
