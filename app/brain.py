@@ -106,7 +106,7 @@ class FloraBrain:
     {{"tool": "web_fetch", "url": "ссылка_на_сайт"}}
 
 11. Автоматизация в браузере (заполнение форм, клики, регистрация):
-    {{"tool": "web_automate", "url": "ссылка_на_сайт", "actions": [{"type": "fill", "selector": "селектор", "value": "значение"}, {"type": "click", "selector": "селектор"}, {"type": "wait", "timeout": 2000}]}}
+    {{"tool": "web_automate", "url": "ссылка_на_сайт", "actions": [[{{"type": "fill", "selector": "селектор", "value": "значение"}}, {{"type": "click", "selector": "селектор"}}, {{"type": "wait", "timeout": 2000}}]]}}
 
 12. Сохранение факта о пользователе в постоянную память:
     {{"tool": "save_user_fact", "key": "ключ", "value": "значение"}}
