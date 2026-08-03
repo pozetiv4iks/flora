@@ -1,0 +1,34 @@
+name: Continuous Deployment to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22 # Standard SSH port, appleboy handles this natively
+          script: |
+            echo "Starting deployment..."
+            # Move to Flora directory
+            cd /root/FloraAgent
+            
+            # Pull latest changes from GitHub (since SSH is configured on HTTPS 443, it will work perfectly)
+            git pull origin main
+            
+            # Rebuild and restart only modified containers
+            docker compose up -d --build
+            
+            # Clean up unused Docker images to save space on VPS NVMe disk
+            docker image prune -f
+            
+            echo "Deployment completed successfully! 🌸"
