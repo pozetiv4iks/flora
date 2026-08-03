@@ -126,7 +126,7 @@ class FloraBrain:
     {{"tool": "web_fetch", "url": "ссылка_на_сайт"}}
 
 11. Автоматизация в браузере (заполнение форм, клики, регистрация):
-    {{"tool": "web_automate", "url": "ссылка_на_сайт", "actions": [[{{"type": "fill", "selector": "селектор", "value": "значение"}}, {{"type": "click", "selector": "селектор"}}, {{"type": "wait", "timeout": 2000}}]]}}
+    {{"tool": "web_automate", "url": "ссылка_на_сайт", "actions": [{{"type": "fill", "selector": "селектор", "value": "значение"}}, {{"type": "click", "selector": "селектор"}}, {{"type": "wait", "timeout": 2000}}]}}
 
 12. Сохранение факта о пользователе в постоянную память:
     {{"tool": "save_user_fact", "key": "ключ", "value": "значение"}}
@@ -355,6 +355,32 @@ class FloraBrain:
                     # Feed the tool result back as system/function message in history
                     # We inject it as a special system log message so the brain "sees" what happened
                     self.db.add_message(user_id, "system", f"[Результат выполнения инструмента {tool_call['tool']}]: {tool_result}")
+                    
+                    # If this was our last iteration, let's run one final completion with tools disabled 
+                    # to summarize the result for the user so they NEVER see raw system logs.
+                    if iteration == max_iterations - 1:
+                        final_history = self.db.get_chat_history(user_id, limit=20)
+                        final_messages = [{"role": "system", "content": self._get_system_prompt(user_id) + "\nВАЖНО: Инструменты отключены. Пожалуйста, напиши пользователю ласковый и понятный ответ, резюмирующий результаты выполненной работы или объясняющий возникшие ошибки."}]
+                        for msg in final_history:
+                            final_messages.append({"role": msg["role"], "content": msg["content"]})
+                            
+                        async with httpx.AsyncClient(timeout=60.0) as client:
+                            final_response = await client.post(
+                                f"{self.base_url}/chat/completions",
+                                headers=headers,
+                                json={
+                                    "model": self.model,
+                                    "messages": final_messages,
+                                    "temperature": 0.7
+                                }
+                            )
+                            final_response.raise_for_status()
+                            final_res_data = final_response.json()
+                            final_reply = final_res_data["choices"][0]["message"]["content"]
+                            
+                            # Save final response and return it
+                            self.db.add_message(user_id, "assistant", final_reply)
+                            return final_reply
                     
             except Exception as e:
                 logger.error(f"Error in brain loop (iteration {iteration}): {e}")
