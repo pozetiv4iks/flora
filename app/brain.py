@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import asyncio
 from typing import List, Dict, Any
 import httpx
 from app.config import Config
@@ -332,8 +333,10 @@ class FloraBrain:
                     json_matches = re.findall(r"\{[^{}]*\"tool\"\s*:[^{}]*\}", reply)
                     
                     if not json_matches:
-                        # No tool call, save final response and return to user
+                        # No tool call, save final response, trigger background auto-learning/reflection, and return to user
                         self.db.add_message(user_id, "assistant", reply)
+                        # Start background non-blocking learning task so it doesn't slow down response delivery
+                        asyncio.create_task(self.auto_learn_from_turn(user_id, user_message, reply))
                         return reply
                     
                     # Extract the JSON block
@@ -381,8 +384,9 @@ class FloraBrain:
                             final_res_data = final_response.json()
                             final_reply = final_res_data["choices"][0]["message"]["content"]
                             
-                            # Save final response and return it
+                            # Save final response, trigger background auto-learning/reflection, and return it
                             self.db.add_message(user_id, "assistant", final_reply)
+                            asyncio.create_task(self.auto_learn_from_turn(user_id, user_message, final_reply))
                             return final_reply
                     
             except Exception as e:
@@ -395,3 +399,103 @@ class FloraBrain:
         # If we exhausted max iterations, return the last reply we have in database
         history = self.db.get_chat_history(user_id, limit=1)
         return history[-1]["content"] if history else "Я сделала все действия, но немного запуталась с выводом ответа. Проверишь мой статус? ❤️"
+
+    async def auto_learn_from_turn(self, user_id: int, user_msg: str, assistant_reply: str):
+        """
+        Background, completely non-blocking task that automatically analyzes the latest conversational turn
+        to extract user facts, startup details, and formulate reflection lessons.
+        This represents Flora's real-time brain development!
+        """
+        logger.info("Running background real-time learning / reflection...")
+        
+        # 1. Fetch current memory state to prevent redundant overwrites
+        user_facts = self.db.get_user_facts()
+        startup_info = self.db.get_startup_info()
+        
+        context_str = f"""Диалог для анализа:
+Пользователь: "{user_msg}"
+Ассистент (Flora): "{assistant_reply}"
+
+Текущая известная память о пользователе:
+{json.dumps(user_facts, ensure_ascii=False, indent=2)}
+
+Текущая известная память о стартапе:
+{json.dumps(startup_info, ensure_ascii=False, indent=2)}
+"""
+
+        system_instruction = """Ты — фоновый ментальный модуль ИИ-агента Flora. Твоя единственная цель — анализировать последнюю реплику и извлекать новые факты о пользователе, новые факты о стартапе, или формулировать выводы (уроки) по результатам технических действий.
+
+Правила извлечения:
+1. Если пользователь упомянул своё имя, возраст, хобби, настроение или личные предпочтения — выдели это.
+2. Если пользователь или Flora упомянули название стартапа, стек технологий, репозитории, цели или проблемы — выдели это.
+3. Если Flora совершила какое-то действие (терминальная команда, гит, файлы) и в диалоге виден результат (успех или ошибка) — сформулируй технический урок (lesson), укажи задачу (task_name) и флаг успеха (success).
+4. Если ничего нового не было упомянуто, верни пустые объекты.
+
+Ты ДОЛЖЕН вернуть строго валидный JSON в следующем формате, без Markdown разметки, без тройных бэктиков ```json и без какого-либо текста вокруг:
+{
+  "user_facts": {"Ключ": "Значение"},
+  "startup_info": {"Ключ": "Значение"},
+  "reflection_lesson": {
+    "task_name": "Название действия или команды",
+    "lesson": "Какой вывод сделан из этого действия (например: 'Команда docker ps упала из-за отсутствия docker в контейнере, нужно использовать run_command на хосте')",
+    "success": true
+  }
+}
+Если технического действия не было совершено, установи "reflection_lesson" в null.
+Помни: пиши ключи и значения на русском языке. Ответ должен содержать ТОЛЬКО чистый JSON-объект."""
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": context_str}
+            ],
+            "temperature": 0.3 # Low temperature for strict structural extraction
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload
+                )
+                response.raise_for_status()
+                res_data = response.json()
+                raw_json = res_data["choices"][0]["message"]["content"].strip()
+                
+                # Cleanup potential code block wraps if the LLM ignored instructions
+                if raw_json.startswith("```"):
+                    raw_json = re.sub(r"^```(?:json)?\n", "", raw_json)
+                    raw_json = re.sub(r"\n```$", "", raw_json)
+                
+                data = json.loads(raw_json)
+                
+                # Write extracted user facts
+                for k, v in data.get("user_facts", {}).items():
+                    logger.info(f"Auto-learned user fact: {k} = {v}")
+                    self.db.set_user_fact(k, v)
+                    
+                # Write extracted startup info
+                for k, v in data.get("startup_info", {}).items():
+                    logger.info(f"Auto-learned startup info: {k} = {v}")
+                    self.db.set_startup_info(k, v)
+                    
+                # Write reflection lesson if any
+                lesson = data.get("reflection_lesson")
+                if lesson and isinstance(lesson, dict):
+                    logger.info(f"Auto-learned reflection lesson: {lesson.get('task_name')} - Success={lesson.get('success')}")
+                    self.db.add_reflection_lesson(
+                        task_name=lesson.get("task_name"),
+                        lesson=lesson.get("lesson"),
+                        success=bool(lesson.get("success"))
+                    )
+                    
+        except Exception as e:
+            logger.error(f"Failed to execute background auto-learning: {e}")
+
