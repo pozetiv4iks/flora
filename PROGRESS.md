@@ -51,7 +51,7 @@
 
 1. **Склонируй этот репозиторий на сервер:**
    ```bash
-   git clone <ссылка_на_репозиторий> FloraAgent
+   git clone git@github.com:pozetiv4iks/flora.git FloraAgent
    cd FloraAgent
    ```
 
