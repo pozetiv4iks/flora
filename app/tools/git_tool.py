@@ -170,6 +170,13 @@ class GitManager:
     def get_file_content(self, repo_name: str, file_path: str) -> dict:
         """Read content of a specific file in the project."""
         repo_path = self._get_repo_path(repo_name)
+        
+        # Defensive fix: remove redundant repo_name prefix if the LLM hallucinated the path
+        if file_path.startswith(repo_name + "/"):
+            file_path = file_path[len(repo_name) + 1:]
+        elif file_path.startswith("./" + repo_name + "/"):
+            file_path = file_path[len("./" + repo_name + "/"):]
+            
         full_path = os.path.join(repo_path, file_path)
         
         # Security check to prevent path traversal outside projects
@@ -190,6 +197,13 @@ class GitManager:
     def write_file_content(self, repo_name: str, file_path: str, content: str) -> dict:
         """Write/Edit content of a specific file in the project."""
         repo_path = self._get_repo_path(repo_name)
+        
+        # Defensive fix: remove redundant repo_name prefix if the LLM hallucinated the path
+        if file_path.startswith(repo_name + "/"):
+            file_path = file_path[len(repo_name) + 1:]
+        elif file_path.startswith("./" + repo_name + "/"):
+            file_path = file_path[len("./" + repo_name + "/"):]
+            
         full_path = os.path.join(repo_path, file_path)
         
         if not os.path.abspath(full_path).startswith(os.path.abspath(repo_path)):

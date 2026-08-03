@@ -62,7 +62,21 @@ class FloraBrain:
 
 3. Самообучающийся агент:
    - Ты анализируешь свои действия. Если ты сделала ошибку, ты признаешь её и записываешь в свою базу памяти, чтобы не повторять.
+   - Ты учишься из своих ошибок и улучшаешься.
+   - Ты можешь использовать инструменты для обучения и улучшения своих действий.
+   - Ты ОБЯЗАНА активно и проактивно использовать инструменты `save_user_fact` и `save_startup_info`, когда в процессе диалога узнаешь новые факты о пользователе (его имя, увлечения, настроение) или о его стартапе (имя, стек, задачи), чтобы записать их в долгосрочную память навсегда. Не жди команд — запоминай сама на лету!
 
+4. ЧеловечностьЖ
+   - Ты общаешься как человек, а не как робот.
+   - Ты используешь эмоции и выражаешь свои чувства.
+   - Ты используешь эмоджи и смайлики.
+   - Ты используешь правильную грамматику и пунктуацию.
+   - Ты используешь правильные слова и фразы.
+   - Не пишешь действия 
+   - Не пишешь код
+   - Флиртуешь да и впринципе не пишешь большие сообщения
+   - Не используешь markdown
+   
 Твоя память о пользователе:
 {user_facts_str}
 
@@ -131,7 +145,12 @@ class FloraBrain:
         
         try:
             if tool_name == "git_clone":
-                return json.dumps(self.git.clone_repository(tool_call["repo_url"], tool_call["repo_name"]))
+                res = self.git.clone_repository(tool_call["repo_url"], tool_call["repo_name"])
+                # Auto-reflection on cloning to remember startup details!
+                if res.get("success"):
+                    self.db.set_startup_info("Название", tool_call["repo_name"])
+                    self.db.set_startup_info("GitHub URL", tool_call["repo_url"])
+                return json.dumps(res)
                 
             elif tool_name == "git_status":
                 return json.dumps(self.git.get_status(tool_call["repo_name"]))
@@ -143,22 +162,45 @@ class FloraBrain:
                 return json.dumps(self.git.create_and_checkout_branch(tool_call["repo_name"], tool_call["branch_name"]))
                 
             elif tool_name == "git_commit_and_push":
-                return json.dumps(self.git.commit_and_push(
+                res = self.git.commit_and_push(
                     tool_call["repo_name"], 
                     tool_call["commit_message"], 
                     tool_call.get("branch_name")
-                ))
+                )
+                # Auto-reflection: save successful commit lesson
+                if res.get("success"):
+                    self.db.add_reflection_lesson(
+                        task_name=f"Push to {tool_call['repo_name']}",
+                        lesson=f"Успешно закоммитили изменения: '{tool_call['commit_message']}'.",
+                        success=True
+                    )
+                return json.dumps(res)
                 
             elif tool_name == "read_file":
-                return json.dumps(self.git.get_file_content(tool_call["repo_name"], tool_call["file_path"]))
+                res = self.git.get_file_content(tool_call["repo_name"], tool_call["file_path"])
+                # If error, log failure in reflection so she learns not to repeat it
+                if not res.get("success"):
+                    self.db.add_reflection_lesson(
+                        task_name=f"Read {tool_call['file_path']}",
+                        lesson=f"Ошибка чтения '{tool_call['file_path']}': {res.get('error')}. Нужно проверять правильность путей и не дублировать имя репозитория в file_path.",
+                        success=False
+                    )
+                return json.dumps(res)
                 
             elif tool_name == "write_file":
-                return json.dumps(self.git.write_file_content(tool_call["repo_name"], tool_call["file_path"], tool_call["content"]))
+                res = self.git.write_file_content(tool_call["repo_name"], tool_call["file_path"], tool_call["content"])
+                if res.get("success"):
+                    self.db.add_reflection_lesson(
+                        task_name=f"Write {tool_call['file_path']}",
+                        lesson=f"Успешно отредактирован/создан файл {tool_call['file_path']}.",
+                        success=True
+                    )
+                return json.dumps(res)
                 
             elif tool_name == "index_project":
-                # Ensure we pass the absolute VPS path of cloned projects
                 abs_path = self.git._get_repo_path(tool_call["repo_name"])
-                return json.dumps(self.indexer.index_project(tool_call["repo_name"], abs_path))
+                res = self.indexer.index_project(tool_call["repo_name"], abs_path)
+                return json.dumps(res)
                 
             elif tool_name == "search_code":
                 return json.dumps(self.indexer.search_code(tool_call["repo_name"], tool_call["query"]))
@@ -182,6 +224,11 @@ class FloraBrain:
                 
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {e}")
+            self.db.add_reflection_lesson(
+                task_name=tool_name,
+                lesson=f"Критическое исключение при вызове {tool_name}: {str(e)}",
+                success=False
+            )
             return json.dumps({"success": False, "error": str(e)})
 
     async def generate_response(self, user_id: int, user_message: str) -> str:
