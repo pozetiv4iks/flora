@@ -135,8 +135,15 @@ async def handle_voice_message(message: types.Message):
                 await message.reply("Солнце, я получила твое голосовое, но не смогла разобрать слова... Может быть, там слишком шумно? Напиши текстом или попробуй перезаписать! 😘❤️")
                 return
                 
-            # 4. Let the brain generate response for the transcribed text
-            reply_text = await brain.generate_response(user_id, f"[Голосовое сообщение]: {transcribed_text}")
+            # Define real-time intermediate response sender
+            async def send_intermediate(text: str):
+                try:
+                    await message.answer(text)
+                except Exception as e:
+                    logger.error(f"Failed to send intermediate response: {e}")
+
+            # 4. Let the brain generate response with real-time callback
+            reply_text = await brain.generate_response(user_id, f"[Голосовое сообщение]: {transcribed_text}", on_intermediate_response=send_intermediate)
             await message.reply(reply_text)
             
         except Exception as e:
@@ -163,8 +170,15 @@ async def handle_message(message: types.Message):
         return
         
     async with typing_status(bot, message.chat.id):
-        # Generate reply using Flora's brain
-        reply_text = await brain.generate_response(user_id, user_text)
+        # Define real-time intermediate response sender
+        async def send_intermediate(text: str):
+            try:
+                await message.answer(text)
+            except Exception as e:
+                logger.error(f"Failed to send intermediate response: {e}")
+
+        # Generate reply using Flora's brain with real-time callback
+        reply_text = await brain.generate_response(user_id, user_text, on_intermediate_response=send_intermediate)
     
     await message.reply(reply_text)
 

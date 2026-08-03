@@ -288,7 +288,7 @@ class FloraBrain:
             )
             return json.dumps({"success": False, "error": str(e)})
 
-    async def generate_response(self, user_id: int, user_message: str) -> str:
+    async def generate_response(self, user_id: int, user_message: str, on_intermediate_response = None) -> str:
         """Generate response using configured LLM with system prompt, history, and iterative tool calling."""
         # 1. Save user message to SQLite DB
         self.db.add_message(user_id, "user", user_message)
@@ -348,6 +348,8 @@ class FloraBrain:
                     clean_reply = reply.replace(tool_json_str, "").strip()
                     if clean_reply:
                         self.db.add_message(user_id, "assistant", clean_reply)
+                        if on_intermediate_response:
+                            await on_intermediate_response(clean_reply)
                         
                     # Execute the tool
                     tool_result = await self.execute_tool(tool_call, user_id)
