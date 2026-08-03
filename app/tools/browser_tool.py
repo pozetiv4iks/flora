@@ -72,6 +72,11 @@ class WebBrowserTool:
         """
         logger.info(f"Starting browser automation on {url}...")
         
+        # Defensive check: if the LLM wrapped actions inside an extra nested list (e.g. [[...]])
+        if isinstance(actions, list) and len(actions) == 1 and isinstance(actions[0], list):
+            logger.info("Defensively unwrapping nested list of actions")
+            actions = actions[0]
+            
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=self.headless)
             context = await browser.new_context(
