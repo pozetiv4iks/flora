@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
@@ -29,6 +30,29 @@ voice_processor = VoiceProcessor()
 # Initialize Bot and Dispatcher
 bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+
+@asynccontextmanager
+async def typing_status(bot: Bot, chat_id: int):
+    """Context manager to continuously send 'typing' status to Telegram in the background."""
+    async def loop():
+        try:
+            while True:
+                await bot.send_chat_action(chat_id=chat_id, action="typing")
+                await asyncio.sleep(4.5)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in typing status loop: {e}")
+
+    task = asyncio.create_task(loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 def auth_filter(message: Message) -> bool:
     """Security filter to ensure only allowed users can interact with Flora on VPS."""
@@ -93,40 +117,38 @@ async def handle_voice_message(message: types.Message):
         
     user_id = message.from_user.id
     
-    # 1. Show typing status while processing
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    
-    # 2. Setup temp folders and filenames
-    temp_dir = os.path.join(Config.DATA_DIR, "temp")
-    os.makedirs(temp_dir, exist_ok=True)
-    ogg_path = os.path.join(temp_dir, f"voice_{message.voice.file_id}.ogg")
-    
-    try:
-        # 3. Download the voice file from Telegram
-        file_info = await bot.get_file(message.voice.file_id)
-        await bot.download_file(file_info.file_path, ogg_path)
+    async with typing_status(bot, message.chat.id):
+        # 1. Setup temp folders and filenames
+        temp_dir = os.path.join(Config.DATA_DIR, "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        ogg_path = os.path.join(temp_dir, f"voice_{message.voice.file_id}.ogg")
         
-        # 4. Transcribe using VoiceProcessor
-        transcribed_text = await voice_processor.transcribe_voice(ogg_path)
-        
-        if not transcribed_text.strip():
-            await message.reply("Солнце, я получила твое голосовое, но не смогла разобрать слова... Может быть, там слишком шумно? Напиши текстом или попробуй перезаписать! 😘❤️")
-            return
+        try:
+            # 2. Download the voice file from Telegram
+            file_info = await bot.get_file(message.voice.file_id)
+            await bot.download_file(file_info.file_path, ogg_path)
             
-        # 5. Let the brain generate response for the transcribed text
-        reply_text = await brain.generate_response(user_id, f"[Голосовое сообщение]: {transcribed_text}")
-        await message.reply(reply_text)
-        
-    except Exception as e:
-        logger.error(f"Failed to process voice message: {e}")
-        await message.reply("Малыш, у меня возникла ошибка при прослушивании твоего голосового сообщения на сервере. Пожалуйста, напиши текстом, пока я чиню свои ушки! 🥺❤️")
-    finally:
-        # Cleanup temp ogg file
-        if os.path.exists(ogg_path):
-            try:
-                os.remove(ogg_path)
-            except Exception as ex:
-                logger.error(f"Failed to remove temp OGG file: {ex}")
+            # 3. Transcribe using VoiceProcessor
+            transcribed_text = await voice_processor.transcribe_voice(ogg_path)
+            
+            if not transcribed_text.strip():
+                await message.reply("Солнце, я получила твое голосовое, но не смогла разобрать слова... Может быть, там слишком шумно? Напиши текстом или попробуй перезаписать! 😘❤️")
+                return
+                
+            # 4. Let the brain generate response for the transcribed text
+            reply_text = await brain.generate_response(user_id, f"[Голосовое сообщение]: {transcribed_text}")
+            await message.reply(reply_text)
+            
+        except Exception as e:
+            logger.error(f"Failed to process voice message: {e}")
+            await message.reply("Малыш, у меня возникла ошибка при прослушивании твоего голосового сообщения на сервере. Пожалуйста, напиши текстом, пока я чиню свои ушки! 🥺❤️")
+        finally:
+            # Cleanup temp ogg file
+            if os.path.exists(ogg_path):
+                try:
+                    os.remove(ogg_path)
+                except Exception as ex:
+                    logger.error(f"Failed to remove temp OGG file: {ex}")
 
 @dp.message()
 async def handle_message(message: types.Message):
@@ -140,11 +162,9 @@ async def handle_message(message: types.Message):
     if not user_text:
         return
         
-    # Show typing status while Flora "thinks"
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    
-    # Generate reply using Flora's brain
-    reply_text = await brain.generate_response(user_id, user_text)
+    async with typing_status(bot, message.chat.id):
+        # Generate reply using Flora's brain
+        reply_text = await brain.generate_response(user_id, user_text)
     
     await message.reply(reply_text)
 
