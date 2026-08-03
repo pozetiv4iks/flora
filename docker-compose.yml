@@ -12,6 +12,8 @@ services:
       - flora_data:/app/data
       # Directory where projects are cloned
       - flora_projects:/app/projects
+      # Persist SSH keys across updates and restarts so they are never lost
+      - flora_ssh:/root/.ssh
       # Mount the host docker socket so Flora can run sandboxed project containers
       - /var/run/docker.sock:/var/run/docker.sock
     # We can pass the path of the project volume on the host to know how to mount it in child containers
@@ -23,4 +25,6 @@ volumes:
   flora_data:
     driver: local
   flora_projects:
+    driver: local
+  flora_ssh:
     driver: local

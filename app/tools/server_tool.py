@@ -11,6 +11,17 @@ class ServerTool:
     def __init__(self):
         self.ssh_dir = os.path.expanduser("~/.ssh")
         os.makedirs(self.ssh_dir, mode=0o700, exist_ok=True)
+        
+        # Defensive: Automatically configure SSH to ignore unknown host prompt (for non-interactive headless git pull/push)
+        config_path = os.path.join(self.ssh_dir, "config")
+        try:
+            # We write StrictHostKeyChecking no to ssh config so git doesn't hang on prompts
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write("Host github.com\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n")
+            os.chmod(config_path, 0o600)
+            logger.info("Successfully configured SSH StrictHostKeyChecking no in ~/.ssh/config")
+        except Exception as e:
+            logger.error(f"Failed to write SSH config: {e}")
 
     def run_command(self, command: str, timeout: int = 60) -> Dict[str, Any]:
         """Run a shell command inside the container (with Docker socket access for host control)."""
