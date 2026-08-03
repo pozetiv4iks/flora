@@ -6,3 +6,6 @@ pydantic>=2.8.2
 docker>=7.1.0
 python-dotenv>=1.0.1
 aiohttp>=3.9.5
+playwright>=1.45.0
+beautifulsoup4>=4.12.3
+
