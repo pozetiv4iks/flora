@@ -14,7 +14,8 @@ class VoiceProcessor:
         # they might still want to use OpenAI for Whisper or their provider supports it.
         # If the API key starts with sk- (standard OpenAI key), we default to standard OpenAI Whisper.
         base_url = Config.LLM_BASE_URL
-        if "openai.com" not in base_url and Config.LLM_API_KEY.startswith("sk-"):
+        # Only override if it's a standard OpenAI key and not an OpenRouter key
+        if "openai.com" not in base_url and Config.LLM_API_KEY.startswith("sk-") and not Config.LLM_API_KEY.startswith("sk-or-"):
             base_url = "https://api.openai.com/v1"
             
         self.client = AsyncOpenAI(api_key=Config.LLM_API_KEY, base_url=base_url)
