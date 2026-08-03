@@ -31,6 +31,12 @@ voice_processor = VoiceProcessor()
 bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
+# Message Debouncing / Grouping System
+# Maps user_id -> [list of raw message texts]
+message_buffers = {}
+# Maps user_id -> asyncio.Task (timer task)
+debounce_tasks = {}
+
 @asynccontextmanager
 async def typing_status(bot: Bot, chat_id: int):
     """Context manager to continuously send 'typing' status to Telegram in the background."""
@@ -169,18 +175,53 @@ async def handle_message(message: types.Message):
     if not user_text:
         return
         
-    async with typing_status(bot, message.chat.id):
-        # Define real-time intermediate response sender
-        async def send_intermediate(text: str):
-            try:
-                await message.answer(text)
-            except Exception as e:
-                logger.error(f"Failed to send intermediate response: {e}")
+    # Put the incoming message text into the buffer for this user
+    if user_id not in message_buffers:
+        message_buffers[user_id] = []
+    message_buffers[user_id].append(user_text)
 
-        # Generate reply using Flora's brain with real-time callback
-        reply_text = await brain.generate_response(user_id, user_text, on_intermediate_response=send_intermediate)
-    
-    await message.reply(reply_text)
+    # If there is an active timer task, cancel it to reset the countdown
+    if user_id in debounce_tasks:
+        debounce_tasks[user_id].cancel()
+
+    # Define the delayed processing task
+    async def delayed_processing():
+        try:
+            # Wait for 2.0 seconds of silence (no new messages from this user)
+            await asyncio.sleep(2.0)
+            
+            # Combine all buffered messages into a single coherent turn
+            buffered_texts = message_buffers.pop(user_id, [])
+            if not buffered_texts:
+                return
+                
+            combined_text = "\n".join(buffered_texts)
+            logger.info(f"Processing debounced combined message for user {user_id} ({len(buffered_texts)} messages merged)")
+            
+            async with typing_status(bot, message.chat.id):
+                # Define real-time intermediate response sender
+                async def send_intermediate(text: str):
+                    try:
+                        await message.answer(text)
+                    except Exception as e:
+                        logger.error(f"Failed to send intermediate response: {e}")
+
+                # Generate reply using Flora's brain with real-time callback
+                reply_text = await brain.generate_response(user_id, combined_text, on_intermediate_response=send_intermediate)
+            
+            await message.reply(reply_text)
+            
+        except asyncio.CancelledError:
+            # Task was cancelled because a new message arrived, which is expected
+            pass
+        except Exception as e:
+            logger.error(f"Error in delayed message processing: {e}")
+        finally:
+            # Clean up task reference
+            debounce_tasks.pop(user_id, None)
+
+    # Start the timer task
+    debounce_tasks[user_id] = asyncio.create_task(delayed_processing())
 
 async def main():
     logger.info("Starting Flora Telegram Bot...")
