@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Install system dependencies (git is required for GitPython, docker-cli to manage docker, ffmpeg for voice processing, and curl for debug)
+# Install base system dependencies (git, curl, and ffmpeg are required)
 RUN apt-get update && apt-get install -y \
     git \
     curl \
@@ -11,9 +11,14 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and install
+# Copy requirements and install python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Use Playwright's built-in CLI to automatically install Chromium AND
+# all of its exact OS-level system dependencies (highly robust on any Debian/Ubuntu version!)
+RUN playwright install chromium
+RUN playwright install-deps chromium
 
 # Create directories for persistent storage and cloned projects
 RUN mkdir -p /app/data /app/projects
