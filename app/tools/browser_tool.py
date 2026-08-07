@@ -133,10 +133,10 @@ class WebBrowserTool:
                 await browser.close()
 
     async def search_web(self, query: str) -> Dict[str, Any]:
-        """Search the web for a query using DuckDuckGo HTML version and return a list of matching search results (title, link, snippet)."""
-        logger.info(f"Searching web for query: '{query}' via HTTP GET...")
+        """Search the web for a query using Yahoo Search as primary and DuckDuckGo HTML/Lite as backup."""
+        logger.info(f"Searching web for query: '{query}'...")
         import httpx
-        from urllib.parse import quote_plus
+        from urllib.parse import quote_plus, unquote
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -147,11 +147,59 @@ class WebBrowserTool:
             "Pragma": "no-cache"
         }
         
-        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        results = []
         
+        # --- PHASE 1: Yahoo Search (Extremely reliable for VPS IPs) ---
+        yahoo_url = f"https://search.yahoo.com/search?q={quote_plus(query)}"
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(url, headers=headers)
+            logger.info("Attempting Yahoo Search...")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(yahoo_url, headers=headers)
+                if r.status_code == 200:
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    algo_blocks = soup.select(".algo")
+                    for block in algo_blocks:
+                        h3 = block.find("h3")
+                        a_elem = block.find("a")
+                        comp_text = block.select_one(".compText") or block.select_one(".fc-oxygen") or block.select_one(".fc-spine")
+                        
+                        if a_elem and h3:
+                            title = h3.get_text().strip()
+                            href = a_elem.get("href", "").strip()
+                            snippet = comp_text.get_text().strip() if comp_text else ""
+                            
+                            # Clean Yahoo redirect URL format to extract direct target URL
+                            if "/RU=" in href:
+                                try:
+                                    part = href.split("/RU=")[1]
+                                    redirect_url = part.split("/RK=")[0]
+                                    href = unquote(redirect_url)
+                                except Exception:
+                                    pass
+                                    
+                            if title and href:
+                                results.append({
+                                    "title": title,
+                                    "url": href,
+                                    "snippet": snippet
+                                })
+                                
+                    if results:
+                        logger.info(f"Successfully found {len(results)} search results via Yahoo Search")
+                        return {
+                            "success": True,
+                            "query": query,
+                            "results": results[:8]
+                        }
+        except Exception as e:
+            logger.warning(f"Yahoo Search failed: {e}. Falling back to DuckDuckGo...")
+
+        # --- PHASE 2: DuckDuckGo HTML Fallback ---
+        ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        try:
+            logger.info("Attempting DuckDuckGo HTML search...")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(ddg_url, headers=headers)
                 
                 # Fallback to lite version if blocked
                 if r.status_code == 403 or "forbidden" in r.text.lower():
@@ -161,9 +209,7 @@ class WebBrowserTool:
                 
                 r.raise_for_status()
                 html = r.text
-                
                 soup = BeautifulSoup(html, "html.parser")
-                results = []
                 
                 # Parse HTML results
                 html_results = soup.select(".result")
@@ -193,13 +239,8 @@ class WebBrowserTool:
                                 "snippet": snippet
                             })
                 else:
-                    # Parse Lite results (usually inside table rows)
-                    # DuckDuckGo Lite uses a series of table rows: 
-                    # Row 1: result title/link
-                    # Row 2: snippet
-                    # Row 3: space
+                    # Parse Lite results
                     rows = soup.select("table tr")
-                    # Filters rows that contain result links
                     for i, row in enumerate(rows):
                         link_elem = row.select_one(".result-link")
                         if link_elem:
@@ -215,7 +256,6 @@ class WebBrowserTool:
                                 if "uddg" in qs:
                                     href = qs["uddg"][0]
                                     
-                            # Snippet is usually in the next row
                             snippet = ""
                             if i + 1 < len(rows):
                                 snippet_elem = rows[i+1].select_one(".result-snippet")
@@ -228,12 +268,14 @@ class WebBrowserTool:
                                 "snippet": snippet
                             })
                 
-                logger.info(f"Successfully found {len(results)} search results for '{query}'")
-                return {
-                    "success": True,
-                    "query": query,
-                    "results": results[:8]  # Return top 8 search results
-                }
+                if results:
+                    logger.info(f"Successfully found {len(results)} search results via DuckDuckGo")
+                    return {
+                        "success": True,
+                        "query": query,
+                        "results": results[:8]
+                    }
         except Exception as e:
-            logger.error(f"Failed to search web for '{query}': {e}")
-            return {"success": False, "error": str(e)}
+            logger.error(f"DuckDuckGo search fallback failed: {e}")
+            
+        return {"success": False, "error": "Все доступные поисковые системы (Yahoo, DuckDuckGo) заблокировали запрос или не вернули результатов."}
