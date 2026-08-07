@@ -150,10 +150,10 @@ class FloraBrain:
    - Ты используешь эмоджи и смайлики.
    - Ты используешь правильную грамматику и пунктуацию.
    - Ты используешь правильные слова и фразы.
-   - Не пишешь действия 
-   - Не пишешь код
-   - Флиртуешь да и впринципе не пишешь большие сообщения
-   - Не используешь markdown
+   - Не пишешь действия в звездочках (например, *улыбается*, *начинает искать* и т.д.) — общайся просто текстом.
+   - Не пишешь технический код (программы, скрипты) в обычном диалоге, кроме случаев, когда пользователь прямо просит написать код для стартапа. Использование JSON-блока вызова инструмента в конце сообщения разрешено и ОБЯЗАТЕЛЬНО.
+   - Флиртуешь да и впринципе не пишешь большие сообщения.
+   - Не используешь markdown в обычном общении (но JSON-блок вызова инструмента в конце сообщения писать нужно обязательно, так как это скрытая системная команда).
    - ВАЖНО: Если ты выполняешь действия, ты ОБЯЗАНА вывести пользователю реальные, точные технические результаты. Никогда не выдумывай результаты и не говори, что "всё готово", если ты физически не запускала инструмент. Не скрывай данные за общими фразами! Если возникла ошибка - покажи её решение и что надо сделать, так же не говори "начинаю", если не начала делать, и не отвечай на каждое сообщение — просто веди диалог!
 
 Твоя память о пользователе:
@@ -170,6 +170,7 @@ class FloraBrain:
 {tools_str}
 
 Правила вызова инструментов:
+- КРИТИЧЕСКИ ВАЖНО: Если пользователь просит тебя найти что-то в интернете, прочитать файл, запустить проект или сделать любую другую техническую задачу, ты ОБЯЗАНА сразу вызвать соответствующий инструмент, прикрепив JSON-блок в конце своего ответа! Никогда не имитируй действия в тексте и не пиши пустых обещаний вроде "я поищу" или "дай мне секунду" без прикрепления JSON-блока! Если ты говоришь, что будешь выполнять действие или искать, ты ОБЯЗАНА прикрепить JSON-блок вызова инструмента!
 - Если пользователь просит тебя выполнить техническое действие, сначала напиши ему поддерживающий эмпатичный ответ в чат, а в САМОМ КОНЦЕ сообщения добавь ТОЛЬКО ОДИН JSON-блок вызова инструмента. Ничего не пиши после JSON-блока.
 - Пример вызова:
   Привет, любимый! Конечно, давай я склонирую этот проект и изучу его структуру для тебя. Начинаю скачивание! ❤️
@@ -374,24 +375,59 @@ class FloraBrain:
                     res_data = response.json()
                     reply = res_data["choices"][0]["message"]["content"]
                     
-                    # Search for any valid JSON block representing tool call at the end of response
-                    json_matches = re.findall(r"\{[^{}]*\"tool\"\s*:[^{}]*\}", reply)
+                    # Find any valid JSON block representing tool call supporting nested structures
+                    tool_json_str = None
+                    idx = 0
+                    candidates = []
+                    while True:
+                        start_idx = reply.find("{", idx)
+                        if start_idx == -1:
+                            break
+                        
+                        # Match braces to find the corresponding close brace, respecting nesting
+                        depth = 0
+                        end_idx = -1
+                        for i in range(start_idx, len(reply)):
+                            if reply[i] == "{":
+                                depth += 1
+                            elif reply[i] == "}":
+                                depth -= 1
+                                if depth == 0:
+                                    end_idx = i
+                                    break
+                        
+                        if end_idx != -1:
+                            candidate = reply[start_idx:end_idx+1]
+                            if '"tool"' in candidate or "'tool'" in candidate:
+                                candidates.append((start_idx, candidate))
+                            idx = start_idx + 1
+                        else:
+                            idx = start_idx + 1
                     
-                    if not json_matches:
+                    if candidates:
+                        candidates.sort(key=lambda x: x[0])
+                        tool_json_str = candidates[-1][1]
+                        
+                    if not tool_json_str:
                         # No tool call, save final response, trigger background auto-learning/reflection, and return to user
                         self.db.add_message(user_id, "assistant", reply)
                         # Start background non-blocking learning task so it doesn't slow down response delivery
                         asyncio.create_task(self.auto_learn_from_turn(user_id, user_message, reply))
                         return reply
                     
-                    # Extract the JSON block
-                    tool_json_str = json_matches[-1]
                     try:
-                        tool_call = json.loads(tool_json_str)
+                        # Normalize single quotes to double quotes if the LLM hallucinated single quotes for JSON
+                        norm_json_str = tool_json_str
+                        if "'" in norm_json_str and '"' not in norm_json_str:
+                            norm_json_str = norm_json_str.replace("'", '"')
+                        tool_call = json.loads(norm_json_str)
                     except Exception:
-                        # If parsing fails, treat as a normal chat response
-                        self.db.add_message(user_id, "assistant", reply)
-                        return reply
+                        try:
+                            tool_call = json.loads(tool_json_str)
+                        except Exception:
+                            # If parsing fails, treat as a normal chat response
+                            self.db.add_message(user_id, "assistant", reply)
+                            return reply
                     
                     # Send tool-execution feedback text (without the JSON) to keep dialog clean
                     clean_reply = reply.replace(tool_json_str, "").strip()
