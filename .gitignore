@@ -9,6 +9,8 @@ __pycache__/
 env/
 venv/
 ENV/
+owner/
+docs/
 env.bak/
 venv.bak/
 

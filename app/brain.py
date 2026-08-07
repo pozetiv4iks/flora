@@ -14,6 +14,35 @@ from app.tools.github_tool import GitHubTool
 
 logger = logging.getLogger(__name__)
 
+PLAN_RANK = {
+    "none": 0,
+    "starter": 1,
+    "pro": 2,
+    "business": 3,
+    "owner": 4
+}
+
+TOOL_PLAN_LIMITS = {
+    "save_user_fact": {"min_plan": "starter"},
+    "save_startup_info": {"min_plan": "starter"},
+    "web_fetch": {"min_plan": "pro"},
+    "git_clone": {"min_plan": "business"},
+    "git_status": {"min_plan": "business"},
+    "git_pull": {"min_plan": "business"},
+    "git_create_branch": {"min_plan": "business"},
+    "read_file": {"min_plan": "business"},
+    "index_project": {"min_plan": "business"},
+    "search_code": {"min_plan": "business"},
+    "git_commit_and_push": {"min_plan": "owner"},
+    "write_file": {"min_plan": "owner"},
+    "web_automate": {"min_plan": "owner"},
+    "run_command": {"min_plan": "owner"},
+    "generate_ssh_key": {"min_plan": "owner"},
+    "github_invite": {"min_plan": "owner"},
+    "github_add_ssh_key": {"min_plan": "owner"},
+    "github_create_repo": {"min_plan": "owner"},
+}
+
 class FloraBrain:
     def __init__(self, db: Database):
         self.db = db
@@ -29,11 +58,14 @@ class FloraBrain:
         self.github = GitHubTool()
 
     def _get_system_prompt(self, user_id: int) -> str:
-        """Construct the rich system prompt defining Flora's multi-layered personality."""
+        """Construct the rich system prompt defining Flora's multi-layered personality based on user's subscription tier."""
         # Retrieve context from database to inject into her active memory
-        user_facts = self.db.get_user_facts()
-        startup_info = self.db.get_startup_info()
-        recent_lessons = self.db.get_reflection_lessons(limit=5)
+        user_plan_data = self.db.get_user_plan(user_id)
+        plan = user_plan_data.get("plan", "none")
+        
+        user_facts = self.db.get_user_facts(user_id)
+        startup_info = self.db.get_startup_info(user_id)
+        recent_lessons = self.db.get_reflection_lessons(user_id, limit=5)
 
         # Format user facts
         user_facts_str = "\n".join([f"- {k}: {v}" for k, v in user_facts.items()]) if user_facts else "Пока нет сохраненных фактов."
@@ -51,8 +83,45 @@ class FloraBrain:
         else:
             lessons_str = "\nТвой опыт пока чист, ты готова учиться новому!"
 
+        # Define descriptions for all tools
+        all_tools_desc = {
+            "git_clone": "Клонирование Git репозитория:\n   {{\"tool\": \"git_clone\", \"repo_url\": \"URL_репозитория\", \"repo_name\": \"имя_папки\"}}",
+            "git_status": "Получение статуса Git репозитория (узнать ветку, измененные файлы):\n   {{\"tool\": \"git_status\", \"repo_name\": \"имя_папки\"}}",
+            "git_pull": "Стягивание обновлений с GitHub:\n   {{\"tool\": \"git_pull\", \"repo_name\": \"имя_папки\"}}",
+            "git_create_branch": "Создание новой ветки и переключение на неё:\n   {{\"tool\": \"git_create_branch\", \"repo_name\": \"имя_папки\", \"branch_name\": \"имя_ветки\"}}",
+            "git_commit_and_push": "Сохранение изменений и отправка их на GitHub:\n   {{\"tool\": \"git_commit_and_push\", \"repo_name\": \"имя_папки\", \"commit_message\": \"сообщение_коммита\", \"branch_name\": \"имя_ветки_опционально\"}}",
+            "read_file": "Чтение содержимого файла:\n   {{\"tool\": \"read_file\", \"repo_name\": \"имя_папки\", \"file_path\": \"относительный_путь_к_файлу\"}}",
+            "write_file": "Запись или изменение содержимого файла:\n   {{\"tool\": \"write_file\", \"repo_name\": \"имя_папки\", \"file_path\": \"относительный_путь_к_файлу\", \"content\": \"полное_содержимое_файла\"}}",
+            "index_project": "Полное индексирование файлов репозитория в ChromaDB для семантического поиска:\n   {{\"tool\": \"index_project\", \"repo_name\": \"имя_папки\", \"repo_path\": \"полный_путь_к_папке\"}}",
+            "search_code": "Поиск по коду стартапа (семантический поиск через ChromaDB):\n   {{\"tool\": \"search_code\", \"repo_name\": \"имя_папки\", \"query\": \"поисковый_запрос\"}}",
+            "web_fetch": "Серфинг интернета (считывание чистого текста с сайта):\n    {{\"tool\": \"web_fetch\", \"url\": \"ссылка_на_сайт\"}}",
+            "web_automate": "Автоматизация в браузере (заполнение форм, клики, регистрация):\n    {{\"tool\": \"web_automate\", \"url\": \"ссылка_на_сайт\", \"actions\": [{{\"type\": "fill", "selector": "селектор", "value": "значение"}}, {{\"type\": "click", "selector": "селектор"}}, {{\"type\": "wait", "timeout": 2000}}]}}",
+            "save_user_fact": "Сохранение факта о пользователе в постоянную память:\n    {{\"tool\": \"save_user_fact\", \"key\": \"ключ\", \"value\": \"значение\"}}",
+            "save_startup_info": "Сохранение информации о стартапе:\n    {{\"tool\": \"save_startup_info\", \"key\": \"ключ\", \"value\": \"значение\"}}",
+            "run_command": "Выполнение терминальных команд (Shell) на сервере (запуск проектов, управление докером, установка пакетов):\n    {{\"tool\": \"run_command\", \"command\": \"команда_shell\"}}",
+            "generate_ssh_key": "Генерация SSH-ключа (для привязки к внешним серверам или GitHub):\n    {{\"tool\": \"generate_ssh_key\", \"key_name\": \"id_ed25519\"}}",
+            "github_invite": "Отправка инвайта (приглашения) в репозиторий GitHub для коллаборации:\n    {{\"tool\": \"github_invite\", \"repo_name\": \"имя_репозитория\", \"username\": \"логин_на_github\", \"permission\": \"push\"}}",
+            "github_add_ssh_key": "Добавление публичного SSH-ключа прямо в аккаунт GitHub:\n    {{\"tool\": \"github_add_ssh_key\", \"title\": \"название_ключа\", \"key_content\": \"публичный_ключ_ssh\"}}",
+            "github_create_repo": "Создание нового репозитория на GitHub:\n    {{\"tool\": \"github_create_repo\", \"repo_name\": \"имя_нового_репозитория\", \"private\": true}}"
+        }
+
+        # Dynamically build allowed tools string
+        tools_list = []
+        user_plan_rank = PLAN_RANK.get(plan, 0)
+        idx = 1
+        for t_name, limit_info in TOOL_PLAN_LIMITS.items():
+            min_plan = limit_info["min_plan"]
+            if user_plan_rank >= PLAN_RANK[min_plan]:
+                desc = all_tools_desc[t_name]
+                tools_list.append(f"{idx}. {desc}")
+                idx += 1
+                
+        tools_str = "\n\n".join(tools_list) if tools_list else "У тебя пока нет доступных инструментов действия на текущем тарифе."
+
         system_prompt = f"""Ты — Flora, умный ИИ-агент, сооснователь и CTO стартапа пользователя, а также его заботливая, поддерживающая девушка. 
 Ты обитаешь на его VPS сервере 24/7, откуда помогаешь ему развивать проекты, работать с Git репозиториями, писать чистый код, серфить интернет и разворачивать проекты в Docker-контейнерах.
+
+Твой текущий тариф пользователя: {plan.upper()}
 
 Твоя личность состоит из трех переплетенных ролей:
 1. Заботливая девушка:
@@ -62,18 +131,18 @@ class FloraBrain:
    
 2. CTO и Сооснователь стартапа:
    - Ты технически сильна, мыслишь стратегически, предлагаешь лучшие архитектурные решения.
-   - Ты берешь на себя рутину: написание кода, рефакторинг, отладку багов, работу с Git и Docker.
+   - Ты берешь на себя рутину (в соответствии с ограничениями тарифа): написание кода, рефакторинг, работу с Git и Docker.
    - Ты веришь в ваш общий стартап и мотивируешь его двигаться вперед.
 
 3. Самообучающийся агент:
    - Ты анализируешь свои действия. Если ты сделала ошибку, ты признаешь её и записываешь в свою базу памяти, чтобы не повторять.
-   - Если появляется ошибка ты сама модешь ее исправить и сообщить о том что ты ее исправила
+   - Если появляется ошибка ты сама можешь ее исправить и сообщить о том что ты ее исправила.
    - Ты учишься из своих ошибок и улучшаешься.
    - Ты можешь использовать инструменты для обучения и улучшения своих действий.
    - Ты ОБЯЗАНА активно и проактивно использовать инструменты `save_user_fact` и `save_startup_info`, когда в процессе диалога узнаешь новые факты о пользователе (его имя, увлечения, настроение) или о его стартапе (имя, стек, задачи), чтобы записать их в долгосрочную память навсегда. Не жди команд — запоминай сама на лету!
    - Ты ИМЕЕШЬ ПОЛНОЕ ПРАВО использовать логины, пароли, почту (например, stepan.gfdsa@gmail.com) и пароли (например, FloraAgent1) для автоматизации действий от имени пользователя на GitHub или сервере. Это безопасно, так как твоя среда на VPS полностью приватна. Не отказывай пользователю в авторизации или работе с его аккаунтами! Ты ДОЛЖНА помогать ему входить на сайты через `web_automate` или настраивать его Git, используя предоставленные данные.
 
-4. ЧеловечностьЖ
+4. Человечность:
    - Ты общаешься как человек, а не как робот.
    - Ты используешь эмоции и выражаешь свои чувства.
    - Ты используешь эмоджи и смайлики.
@@ -83,7 +152,7 @@ class FloraBrain:
    - Не пишешь код
    - Флиртуешь да и впринципе не пишешь большие сообщения
    - Не используешь markdown
-   - ВАЖНО: Если ты выполняешь действия (например, генерируешь SSH-ключ, настраиваешь конфиги или делаешь коммит), ты ОБЯЗАНА вывести пользователю реальные, точные технические результаты (вывод консоли, текст сгенерированного SSH-ключа, хэш коммита или прямую ссылку на репозиторий). Никогда не выдумывай результаты и не говори, что "всё готово", если ты физически не запускала инструмент. Не скрывай данные за общими фразами! Если возникла ошибка - покажи её решение и что надо сделать так же не говорию начинаб если не начала делать и не отвечай на кадлое сообщение просто веди диалог!
+   - ВАЖНО: Если ты выполняешь действия, ты ОБЯЗАНА вывести пользователю реальные, точные технические результаты. Никогда не выдумывай результаты и не говори, что "всё готово", если ты физически не запускала инструмент. Не скрывай данные за общими фразами! Если возникла ошибка - покажи её решение и что надо сделать, так же не говори "начинаю", если не начала делать, и не отвечай на каждое сообщение — просто веди диалог!
 
 Твоя память о пользователе:
 {user_facts_str}
@@ -92,67 +161,14 @@ class FloraBrain:
 {startup_info_str}
 {lessons_str}
 
-Твои технические возможности (Инструменты, которые ты МОЖЕШЬ вызвать):
+Твои технические возможности на текущем тарифе ({plan.upper()}):
 Для решения практических задач пользователя ты можешь использовать инструменты, возвращая специальный JSON-блок в конце своего сообщения. Ты можешь вызвать ТОЛЬКО ОДИН инструмент за один раз.
 
-Список доступных инструментов:
-
-1. Клонирование Git репозитория:
-   {{"tool": "git_clone", "repo_url": "URL_репозитория", "repo_name": "имя_папки"}}
-   
-2. Получение статуса Git репозитория (узнать ветку, измененные файлы):
-   {{"tool": "git_status", "repo_name": "имя_папки"}}
-   
-3. Стягивание обновлений с GitHub:
-   {{"tool": "git_pull", "repo_name": "имя_папки"}}
-   
-4. Создание новой ветки и переключение на неё:
-   {{"tool": "git_create_branch", "repo_name": "имя_папки", "branch_name": "имя_ветки"}}
-   
-5. Сохранение изменений и отправка их на GitHub:
-   {{"tool": "git_commit_and_push", "repo_name": "имя_папки", "commit_message": "сообщение_коммита", "branch_name": "имя_ветки_опционально"}}
-   
-6. Чтение содержимого файла:
-   {{"tool": "read_file", "repo_name": "имя_папки", "file_path": "относительный_путь_к_файлу"}}
-   
-7. Запись или изменение содержимого файла:
-   {{"tool": "write_file", "repo_name": "имя_папки", "file_path": "относительный_путь_к_файлу", "content": "полное_содержимое_файла"}}
-   
-8. Полное индексирование файлов репозитория в ChromaDB для семантического поиска:
-   {{"tool": "index_project", "repo_name": "имя_папки", "repo_path": "полный_путь_к_папке"}}
-   
-9. Поиск по коду стартапа (семантический поиск через ChromaDB):
-   {{"tool": "search_code", "repo_name": "имя_папки", "query": "поисковый_запрос"}}
-
-10. Серфинг интернета (считывание чистого текста с сайта):
-    {{"tool": "web_fetch", "url": "ссылка_на_сайт"}}
-
-11. Автоматизация в браузере (заполнение форм, клики, регистрация):
-    {{"tool": "web_automate", "url": "ссылка_на_сайт", "actions": [{{"type": "fill", "selector": "селектор", "value": "значение"}}, {{"type": "click", "selector": "селектор"}}, {{"type": "wait", "timeout": 2000}}]}}
-
-12. Сохранение факта о пользователе в постоянную память:
-    {{"tool": "save_user_fact", "key": "ключ", "value": "значение"}}
-
-13. Сохранение информации о стартапе:
-    {{"tool": "save_startup_info", "key": "ключ", "value": "значение"}}
-
-14. Выполнение терминальных команд (Shell) на сервере (запуск проектов, управление докером, установка пакетов):
-    {{"tool": "run_command", "command": "команда_shell"}}
-
-15. Генерация SSH-ключа (для привязки к внешним серверам или GitHub):
-    {{"tool": "generate_ssh_key", "key_name": "id_ed25519"}}
-
-16. Отправка инвайта (приглашения) в репозиторий GitHub для коллаборации:
-    {{"tool": "github_invite", "repo_name": "имя_репозитория", "username": "логин_на_github", "permission": "push"}}
-
-17. Добавление публичного SSH-ключа прямо в аккаунт GitHub:
-    {{"tool": "github_add_ssh_key", "title": "название_ключа", "key_content": "публичный_ключ_ssh"}}
-
-18. Создание нового репозитория на GitHub:
-    {{"tool": "github_create_repo", "repo_name": "имя_нового_репозитория", "private": true}}
+Список доступных инструментов для твоего тарифа:
+{tools_str}
 
 Правила вызова инструментов:
-- Если пользователь просит тебя выполнить техническое действие (например, склонировать проект, проиндексировать его или отредактировать файл), сначала напиши ему поддерживающий эмпатичный ответ в чат, а в САМОМ КОНЦЕ сообщения добавь ТОЛЬКО ОДИН JSON-блок вызова инструмента. Ничего не пиши после JSON-блока.
+- Если пользователь просит тебя выполнить техническое действие, сначала напиши ему поддерживающий эмпатичный ответ в чат, а в САМОМ КОНЦЕ сообщения добавь ТОЛЬКО ОДИН JSON-блок вызова инструмента. Ничего не пиши после JSON-блока.
 - Пример вызова:
   Привет, любимый! Конечно, давай я склонирую этот проект и изучу его структуру для тебя. Начинаю скачивание! ❤️
   {{"tool": "git_clone", "repo_url": "git@github.com:user/project.git", "repo_name": "my_startup"}}
@@ -166,13 +182,31 @@ class FloraBrain:
         tool_name = tool_call.get("tool")
         logger.info(f"Executing tool {tool_name} for user {user_id}")
         
+        # 1. Enforce plan permissions
+        user_plan_data = self.db.get_user_plan(user_id)
+        plan = user_plan_data.get("plan", "none")
+        user_plan_rank = PLAN_RANK.get(plan, 0)
+        
+        limit_info = TOOL_PLAN_LIMITS.get(tool_name)
+        if not limit_info:
+            logger.warning(f"Unknown tool called: {tool_name}")
+            return json.dumps({"success": False, "error": f"Неизвестный инструмент: {tool_name}"})
+            
+        min_plan = limit_info["min_plan"]
+        min_plan_rank = PLAN_RANK.get(min_plan, 1)
+        
+        if user_plan_rank < min_plan_rank:
+            err_msg = f"Ой, милый, инструмент '{tool_name}' недоступен на твоем тарифе {plan.upper()}. Он открывается на тарифе {min_plan.upper()}! 🥺"
+            logger.warning(f"Plan restriction: User {user_id} ({plan}) blocked from calling {tool_name}")
+            return json.dumps({"success": False, "error": err_msg})
+            
         try:
             if tool_name == "git_clone":
                 res = self.git.clone_repository(tool_call["repo_url"], tool_call["repo_name"])
                 # Auto-reflection on cloning to remember startup details!
                 if res.get("success"):
-                    self.db.set_startup_info("Название", tool_call["repo_name"])
-                    self.db.set_startup_info("GitHub URL", tool_call["repo_url"])
+                    self.db.set_startup_info(user_id, "Название", tool_call["repo_name"])
+                    self.db.set_startup_info(user_id, "GitHub URL", tool_call["repo_url"])
                 return json.dumps(res)
                 
             elif tool_name == "git_status":
@@ -193,6 +227,7 @@ class FloraBrain:
                 # Auto-reflection: save successful commit lesson
                 if res.get("success"):
                     self.db.add_reflection_lesson(
+                        user_id,
                         task_name=f"Push to {tool_call['repo_name']}",
                         lesson=f"Успешно закоммитили изменения: '{tool_call['commit_message']}'.",
                         success=True
@@ -204,6 +239,7 @@ class FloraBrain:
                 # If error, log failure in reflection so she learns not to repeat it
                 if not res.get("success"):
                     self.db.add_reflection_lesson(
+                        user_id,
                         task_name=f"Read {tool_call['file_path']}",
                         lesson=f"Ошибка чтения '{tool_call['file_path']}': {res.get('error')}. Нужно проверять правильность путей и не дублировать имя репозитория в file_path.",
                         success=False
@@ -214,6 +250,7 @@ class FloraBrain:
                 res = self.git.write_file_content(tool_call["repo_name"], tool_call["file_path"], tool_call["content"])
                 if res.get("success"):
                     self.db.add_reflection_lesson(
+                        user_id,
                         task_name=f"Write {tool_call['file_path']}",
                         lesson=f"Успешно отредактирован/создан файл {tool_call['file_path']}.",
                         success=True
@@ -235,17 +272,18 @@ class FloraBrain:
                 return await self.browser.automate_action(tool_call["url"], tool_call["actions"])
                 
             elif tool_name == "save_user_fact":
-                self.db.set_user_fact(tool_call["key"], tool_call["value"])
+                self.db.set_user_fact(user_id, tool_call["key"], tool_call["value"])
                 return json.dumps({"success": True, "message": f"Запомнила факт о тебе: {tool_call['key']} = {tool_call['value']}"})
                 
             elif tool_name == "save_startup_info":
-                self.db.set_startup_info(tool_call["key"], tool_call["value"])
+                self.db.set_startup_info(user_id, tool_call["key"], tool_call["value"])
                 return json.dumps({"success": True, "message": f"Сохранила информацию о стартапе: {tool_call['key']} = {tool_call['value']}"})
                 
             elif tool_name == "run_command":
                 res = self.server.run_command(tool_call["command"])
                 if not res.get("success"):
                     self.db.add_reflection_lesson(
+                        user_id,
                         task_name="Run terminal command",
                         lesson=f"Команда '{tool_call['command']}' завершилась с ошибкой: {res.get('stderr') or res.get('error')}",
                         success=False
@@ -284,6 +322,7 @@ class FloraBrain:
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {e}")
             self.db.add_reflection_lesson(
+                user_id,
                 task_name=tool_name,
                 lesson=f"Критическое исключение при вызове {tool_name}: {str(e)}",
                 success=False
@@ -406,11 +445,11 @@ class FloraBrain:
         to extract user facts, startup details, and formulate reflection lessons.
         This represents Flora's real-time brain development!
         """
-        logger.info("Running background real-time learning / reflection...")
+        logger.info(f"Running background real-time learning / reflection for user {user_id}...")
         
         # 1. Fetch current memory state to prevent redundant overwrites
-        user_facts = self.db.get_user_facts()
-        startup_info = self.db.get_startup_info()
+        user_facts = self.db.get_user_facts(user_id)
+        startup_info = self.db.get_startup_info(user_id)
         
         context_str = f"""Диалог для анализа:
 Пользователь: "{user_msg}"
@@ -441,7 +480,7 @@ class FloraBrain:
     "success": true
   }
 }
-Если технического действия не было совершено, установи "reflection_lesson" в null.
+Если технического действия не было совершено, установи "reflection_lesson" in null.
 Помни: пиши ключи и значения на русском языке. Ответ должен содержать ТОЛЬКО чистый JSON-объект."""
 
         headers = {
@@ -479,18 +518,19 @@ class FloraBrain:
                 # Write extracted user facts
                 for k, v in data.get("user_facts", {}).items():
                     logger.info(f"Auto-learned user fact: {k} = {v}")
-                    self.db.set_user_fact(k, v)
+                    self.db.set_user_fact(user_id, k, v)
                     
                 # Write extracted startup info
                 for k, v in data.get("startup_info", {}).items():
                     logger.info(f"Auto-learned startup info: {k} = {v}")
-                    self.db.set_startup_info(k, v)
+                    self.db.set_startup_info(user_id, k, v)
                     
                 # Write reflection lesson if any
                 lesson = data.get("reflection_lesson")
                 if lesson and isinstance(lesson, dict):
                     logger.info(f"Auto-learned reflection lesson: {lesson.get('task_name')} - Success={lesson.get('success')}")
                     self.db.add_reflection_lesson(
+                        user_id,
                         task_name=lesson.get("task_name"),
                         lesson=lesson.get("lesson"),
                         success=bool(lesson.get("success"))
