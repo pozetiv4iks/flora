@@ -291,7 +291,7 @@ async def handle_voice_message(message: types.Message):
             transcribed_text = await voice_processor.transcribe_voice(ogg_path)
             
             if not transcribed_text.strip():
-                await message.reply("Солнце, я получила твое голосовое, но не смогла разобрать слова... Может быть, там слишком шумно? Напиши текстом или попробуй перезаписать! 😘❤️")
+                await message.answer("Солнце, я получила твое голосовое, но не смогла разобрать слова... Может быть, там слишком шумно? Напиши текстом или попробуй перезаписать! 😘❤️")
                 return
                 
             # Define real-time intermediate response sender
@@ -303,14 +303,14 @@ async def handle_voice_message(message: types.Message):
 
             # 4. Let the brain generate response with real-time callback
             reply_text = await brain.generate_response(user_id, f"[Голосовое сообщение]: {transcribed_text}", on_intermediate_response=send_intermediate)
-            await message.reply(reply_text)
+            await message.answer(reply_text)
             
             # 5. Increment usage counter
             db.increment_usage(user_id, "messages")
             
         except Exception as e:
             logger.error(f"Failed to process voice message: {e}")
-            await message.reply("Малыш, у меня возникла ошибка при прослушивании твоего голосового сообщения на сервере. Пожалуйста, напиши текстом, пока я чиню свои ушки! 🥺❤️")
+            await message.answer("Малыш, у меня возникла ошибка при прослушивании твоего голосового сообщения на сервере. Пожалуйста, напиши текстом, пока я чиню свои ушки! 🥺❤️")
         finally:
             # Cleanup temp ogg file
             if os.path.exists(ogg_path):
@@ -365,7 +365,7 @@ async def handle_message(message: types.Message):
                 # Generate reply using Flora's brain with real-time callback
                 reply_text = await brain.generate_response(user_id, combined_text, on_intermediate_response=send_intermediate)
             
-            await message.reply(reply_text)
+            await message.answer(reply_text)
             
             # Increment daily message count
             db.increment_usage(user_id, "messages")
