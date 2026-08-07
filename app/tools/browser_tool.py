@@ -134,60 +134,106 @@ class WebBrowserTool:
 
     async def search_web(self, query: str) -> Dict[str, Any]:
         """Search the web for a query using DuckDuckGo HTML version and return a list of matching search results (title, link, snippet)."""
-        logger.info(f"Searching web for query: '{query}'...")
+        logger.info(f"Searching web for query: '{query}' via HTTP GET...")
+        import httpx
+        from urllib.parse import quote_plus
         
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.headless)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-            page = await context.new_page()
-            
-            try:
-                # DuckDuckGo HTML version is very clean and easy to scrape
-                url = f"https://html.duckduckgo.com/html/?q={query}"
-                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache"
+        }
+        
+        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(url, headers=headers)
                 
-                html = await page.content()
+                # Fallback to lite version if blocked
+                if r.status_code == 403 or "forbidden" in r.text.lower():
+                    logger.warning("DuckDuckGo HTML returned 403 or forbidden. Falling back to DuckDuckGo Lite...")
+                    lite_url = f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
+                    r = await client.get(lite_url, headers=headers)
+                
+                r.raise_for_status()
+                html = r.text
+                
                 soup = BeautifulSoup(html, "html.parser")
-                
                 results = []
-                for result in soup.select(".result"):
-                    title_elem = result.select_one(".result__title")
-                    snippet_elem = result.select_one(".result__snippet")
-                    
-                    if title_elem and snippet_elem:
-                        title = title_elem.get_text().strip()
-                        snippet = snippet_elem.get_text().strip()
-                        # Get URL
-                        a_elem = title_elem.select_one("a")
-                        href = a_elem["href"] if a_elem else ""
+                
+                # Parse HTML results
+                html_results = soup.select(".result")
+                if html_results:
+                    for result in html_results:
+                        title_elem = result.select_one(".result__title")
+                        snippet_elem = result.select_one(".result__snippet")
                         
-                        # Handle proxy redirect urls from duckduckgo
-                        if href.startswith("//"):
-                            href = "https:" + href
-                        elif "uddg=" in href:
-                            # Extract actual URL if redirected
-                            from urllib.parse import unquote, urlparse, parse_qs
-                            parsed = urlparse(href)
-                            qs = parse_qs(parsed.query)
-                            if "uddg" in qs:
-                                href = qs["uddg"][0]
-                                
-                        results.append({
-                            "title": title,
-                            "url": href,
-                            "snippet": snippet
-                        })
-                        
+                        if title_elem and snippet_elem:
+                            title = title_elem.get_text().strip()
+                            snippet = snippet_elem.get_text().strip()
+                            a_elem = title_elem.select_one("a")
+                            href = a_elem["href"] if a_elem else ""
+                            
+                            if href.startswith("//"):
+                                href = "https:" + href
+                            elif "uddg=" in href:
+                                from urllib.parse import unquote, urlparse, parse_qs
+                                parsed = urlparse(href)
+                                qs = parse_qs(parsed.query)
+                                if "uddg" in qs:
+                                    href = qs["uddg"][0]
+                                    
+                            results.append({
+                                "title": title,
+                                "url": href,
+                                "snippet": snippet
+                            })
+                else:
+                    # Parse Lite results (usually inside table rows)
+                    # DuckDuckGo Lite uses a series of table rows: 
+                    # Row 1: result title/link
+                    # Row 2: snippet
+                    # Row 3: space
+                    rows = soup.select("table tr")
+                    # Filters rows that contain result links
+                    for i, row in enumerate(rows):
+                        link_elem = row.select_one(".result-link")
+                        if link_elem:
+                            title = link_elem.get_text().strip()
+                            href = link_elem["href"] if link_elem.has_attr("href") else ""
+                            
+                            if href.startswith("//"):
+                                href = "https:" + href
+                            elif "uddg=" in href:
+                                from urllib.parse import unquote, urlparse, parse_qs
+                                parsed = urlparse(href)
+                                qs = parse_qs(parsed.query)
+                                if "uddg" in qs:
+                                    href = qs["uddg"][0]
+                                    
+                            # Snippet is usually in the next row
+                            snippet = ""
+                            if i + 1 < len(rows):
+                                snippet_elem = rows[i+1].select_one(".result-snippet")
+                                if snippet_elem:
+                                    snippet = snippet_elem.get_text().strip()
+                            
+                            results.append({
+                                "title": title,
+                                "url": href,
+                                "snippet": snippet
+                            })
+                
                 logger.info(f"Successfully found {len(results)} search results for '{query}'")
                 return {
                     "success": True,
                     "query": query,
                     "results": results[:8]  # Return top 8 search results
                 }
-            except Exception as e:
-                logger.error(f"Failed to search web for '{query}': {e}")
-                return {"success": False, "error": str(e)}
-            finally:
-                await browser.close()
+        except Exception as e:
+            logger.error(f"Failed to search web for '{query}': {e}")
+            return {"success": False, "error": str(e)}
