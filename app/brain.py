@@ -25,6 +25,7 @@ PLAN_RANK = {
 TOOL_PLAN_LIMITS = {
     "save_user_fact": {"min_plan": "starter"},
     "save_startup_info": {"min_plan": "starter"},
+    "web_search": {"min_plan": "pro"},
     "web_fetch": {"min_plan": "pro"},
     "git_clone": {"min_plan": "business"},
     "git_status": {"min_plan": "business"},
@@ -94,7 +95,8 @@ class FloraBrain:
             "write_file": "Запись или изменение содержимого файла:\n   {{\"tool\": \"write_file\", \"repo_name\": \"имя_папки\", \"file_path\": \"относительный_путь_к_файлу\", \"content\": \"полное_содержимое_файла\"}}",
             "index_project": "Полное индексирование файлов репозитория в ChromaDB для семантического поиска:\n   {{\"tool\": \"index_project\", \"repo_name\": \"имя_папки\", \"repo_path\": \"полный_путь_к_папке\"}}",
             "search_code": "Поиск по коду стартапа (семантический поиск через ChromaDB):\n   {{\"tool\": \"search_code\", \"repo_name\": \"имя_папки\", \"query\": \"поисковый_запрос\"}}",
-            "web_fetch": "Серфинг интернета (считывание чистого текста с сайта):\n    {{\"tool\": \"web_fetch\", \"url\": \"ссылка_на_сайт\"}}",
+            "web_search": "Поиск информации в интернете через поисковик (получить список сайтов и ссылок по твоему запросу):\n    {{\"tool\": \"web_search\", \"query\": \"поисковый_запрос_в_интернете\"}}",
+            "web_fetch": "Серфинг интернета (считывание чистого текста с конкретного сайта/ссылки):\n    {{\"tool\": \"web_fetch\", \"url\": \"ссылка_на_сайт\"}}",
             "web_automate": "Автоматизация в браузере (заполнение форм, клики, регистрация):\n    {{\"tool\": \"web_automate\", \"url\": \"ссылка_на_сайт\", \"actions\": [{{\"type\": \"fill\", \"selector\": \"селектор\", \"value\": \"значение\"}}, {{\"type\": \"click\", \"selector\": \"селектор\"}}, {{\"type\": \"wait\", \"timeout\": 2000}}]}}",
             "save_user_fact": "Сохранение факта о пользователе в постоянную память:\n    {{\"tool\": \"save_user_fact\", \"key\": \"ключ\", \"value\": \"значение\"}}",
             "save_startup_info": "Сохранение информации о стартапе:\n    {{\"tool\": \"save_startup_info\", \"key\": \"ключ\", \"value\": \"значение\"}}",
@@ -267,6 +269,10 @@ class FloraBrain:
                 
             elif tool_name == "web_fetch":
                 return await self.browser.fetch_page_content(tool_call["url"])
+                
+            elif tool_name == "web_search":
+                res = await self.browser.search_web(tool_call["query"])
+                return json.dumps(res)
                 
             elif tool_name == "web_automate":
                 return await self.browser.automate_action(tool_call["url"], tool_call["actions"])

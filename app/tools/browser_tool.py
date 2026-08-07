@@ -131,3 +131,63 @@ class WebBrowserTool:
                 return {"success": False, "error": str(e)}
             finally:
                 await browser.close()
+
+    async def search_web(self, query: str) -> Dict[str, Any]:
+        """Search the web for a query using DuckDuckGo HTML version and return a list of matching search results (title, link, snippet)."""
+        logger.info(f"Searching web for query: '{query}'...")
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=self.headless)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            
+            try:
+                # DuckDuckGo HTML version is very clean and easy to scrape
+                url = f"https://html.duckduckgo.com/html/?q={query}"
+                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                
+                html = await page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                
+                results = []
+                for result in soup.select(".result"):
+                    title_elem = result.select_one(".result__title")
+                    snippet_elem = result.select_one(".result__snippet")
+                    
+                    if title_elem and snippet_elem:
+                        title = title_elem.get_text().strip()
+                        snippet = snippet_elem.get_text().strip()
+                        # Get URL
+                        a_elem = title_elem.select_one("a")
+                        href = a_elem["href"] if a_elem else ""
+                        
+                        # Handle proxy redirect urls from duckduckgo
+                        if href.startswith("//"):
+                            href = "https:" + href
+                        elif "uddg=" in href:
+                            # Extract actual URL if redirected
+                            from urllib.parse import unquote, urlparse, parse_qs
+                            parsed = urlparse(href)
+                            qs = parse_qs(parsed.query)
+                            if "uddg" in qs:
+                                href = qs["uddg"][0]
+                                
+                        results.append({
+                            "title": title,
+                            "url": href,
+                            "snippet": snippet
+                        })
+                        
+                logger.info(f"Successfully found {len(results)} search results for '{query}'")
+                return {
+                    "success": True,
+                    "query": query,
+                    "results": results[:8]  # Return top 8 search results
+                }
+            except Exception as e:
+                logger.error(f"Failed to search web for '{query}': {e}")
+                return {"success": False, "error": str(e)}
+            finally:
+                await browser.close()
