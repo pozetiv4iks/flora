@@ -154,6 +154,17 @@ class Database:
                 )
             """)
             
+            # Creation of temp_browser_cookies table for large, chunked multi-message session injection
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS temp_browser_cookies (
+                    user_id INTEGER,
+                    domain TEXT,
+                    accumulated_text TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, domain)
+                )
+            """)
+            
             conn.commit()
 
     # --- Chat History Methods ---
@@ -334,3 +345,34 @@ class Database:
                     return r["cookies_json"]
                     
             return None
+
+    # --- Temp Browser Cookies Chunk Methods (Chunked Assembly) ---
+    def get_temp_cookie_chunks(self, user_id: int, domain: str) -> str:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT accumulated_text FROM temp_browser_cookies WHERE user_id = ? AND domain = ?",
+                (user_id, domain.lower().strip())
+            )
+            row = cursor.fetchone()
+            if row:
+                return row["accumulated_text"]
+            return ""
+
+    def set_temp_cookie_chunks(self, user_id: int, domain: str, text: str):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO temp_browser_cookies (user_id, domain, accumulated_text, updated_at) VALUES (?, ?, ?, ?)",
+                (user_id, domain.lower().strip(), text, datetime.now().isoformat())
+            )
+            conn.commit()
+
+    def clear_temp_cookie_chunks(self, user_id: int, domain: str):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM temp_browser_cookies WHERE user_id = ? AND domain = ?",
+                (user_id, domain.lower().strip())
+            )
+            conn.commit()

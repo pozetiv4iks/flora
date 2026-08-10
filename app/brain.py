@@ -281,8 +281,63 @@ class FloraBrain:
                 return await self.browser.automate_action(tool_call["url"], tool_call["actions"], user_id=user_id)
                 
             elif tool_name == "save_browser_cookies":
-                self.db.set_browser_cookies(user_id, tool_call["domain"], tool_call["cookies_json"])
-                return json.dumps({"success": True, "message": f"Сессионные куки для домена '{tool_call['domain']}' успешно сохранены в твою базу данных! Теперь при любом обращении к этому сайту я автоматически авторизуюсь под твоей сессией."})
+                input_cookies = tool_call["cookies_json"].strip()
+                domain = tool_call["domain"].lower().strip()
+                
+                # Helper function to strip markdown code blocks
+                def clean_json_str(s: str) -> str:
+                    s = s.strip()
+                    if s.startswith("```"):
+                        lines = s.splitlines()
+                        if lines[0].startswith("```"):
+                            lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        s = "\n".join(lines).strip()
+                    return s
+                
+                cleaned_input = clean_json_str(input_cookies)
+                
+                # 1. Try parsing directly
+                try:
+                    parsed = json.loads(cleaned_input)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        self.db.set_browser_cookies(user_id, domain, json.dumps(parsed))
+                        self.db.clear_temp_cookie_chunks(user_id, domain)
+                        return json.dumps({
+                            "success": True,
+                            "completed": True,
+                            "message": f"Куки для домена '{domain}' успешно распарсены и сохранены целиком! Найдено {len(parsed)} кук."
+                        })
+                except Exception:
+                    pass
+                
+                # 2. Try appending to existing chunks
+                accumulated = self.db.get_temp_cookie_chunks(user_id, domain) or ""
+                combined = accumulated + cleaned_input
+                
+                # Clean up characters that might be duplicated or missed during splits (e.g. \n)
+                # Playwright and standard JSON can parse it as long as the character sequence is valid.
+                try:
+                    parsed = json.loads(combined)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        self.db.set_browser_cookies(user_id, domain, json.dumps(parsed))
+                        self.db.clear_temp_cookie_chunks(user_id, domain)
+                        return json.dumps({
+                            "success": True,
+                            "completed": True,
+                            "message": f"Ура! Все части куков для домена '{domain}' успешно соединены, распарсены и сохранены! Всего собрано {len(parsed)} кук."
+                        })
+                except Exception as ex:
+                    logger.info(f"Concat cookie parsing still failed: {ex}")
+                
+                # 3. Store the chunk and ask for more
+                self.db.set_temp_cookie_chunks(user_id, domain, combined)
+                return json.dumps({
+                    "success": True,
+                    "completed": False,
+                    "message": f"Часть куков для домена '{domain}' сохранена в буфер. Итоговый JSON пока неполный (ошибка синтаксиса). Пожалуйста, отправь следующую часть куков, чтобы я соединила их!"
+                })
                 
             elif tool_name == "save_user_fact":
                 self.db.set_user_fact(user_id, tool_call["key"], tool_call["value"])
