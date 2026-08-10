@@ -1,18 +1,61 @@
 import logging
 import asyncio
+import json
 from typing import Dict, Any, Optional
+from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
+from app.database import Database
 
 logger = logging.getLogger(__name__)
 
 class WebBrowserTool:
     """Advanced Headless Browser Tool for Flora to surf, fill forms, and register on websites."""
     
-    def __init__(self, headless: bool = True):
+    def __init__(self, db: Database, headless: bool = True):
+        self.db = db
         self.headless = headless
 
-    async def fetch_page_content(self, url: str) -> Dict[str, Any]:
+    def _extract_domain(self, url: str) -> str:
+        """Extract the main domain from a URL for domain-scoped cookies lookup."""
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower().strip()
+            if domain.startswith("www."):
+                domain = domain[4:]
+            return domain
+        except Exception as e:
+            logger.error(f"Error parsing domain from {url}: {e}")
+            return ""
+
+    async def _inject_cookies_if_any(self, context, url: str, user_id: Optional[int]):
+        """Query SQLite database for stored cookies for the target domain and inject them into browser context."""
+        if not user_id or not self.db:
+            return
+            
+        domain = self._extract_domain(url)
+        if not domain:
+            return
+            
+        try:
+            cookies_json = self.db.get_browser_cookies(user_id, domain)
+            if cookies_json:
+                logger.info(f"Session Injection: Found stored cookies for domain '{domain}'. Injecting into browser context...")
+                cookies = json.loads(cookies_json)
+                if isinstance(cookies, list):
+                    # Ensure domain/path properties exist correctly
+                    for cookie in cookies:
+                        if "domain" in cookie and not cookie["domain"].startswith("."):
+                            # Normalize domain format if exported with leading dot missing or vice versa
+                            pass
+                    await context.add_cookies(cookies)
+                    logger.info(f"Successfully injected {len(cookies)} cookies into browser context for '{domain}'!")
+            else:
+                logger.info(f"Session Injection: No cookies stored for domain '{domain}'. Using clean session.")
+        except Exception as e:
+            logger.error(f"Failed to inject session cookies: {e}")
+
+    async def fetch_page_content(self, url: str, user_id: Optional[int] = None) -> Dict[str, Any]:
         """Navigate to a website, wait for render, and extract clean text content."""
         logger.info(f"Navigating to {url}...")
         
@@ -23,6 +66,10 @@ class WebBrowserTool:
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 800}
             )
+            
+            # Inject session cookies if stored in DB
+            await self._inject_cookies_if_any(context, url, user_id)
+            
             page = await context.new_page()
             
             try:
@@ -59,7 +106,7 @@ class WebBrowserTool:
             finally:
                 await browser.close()
 
-    async def automate_action(self, url: str, actions: list) -> Dict[str, Any]:
+    async def automate_action(self, url: str, actions: list, user_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Execute custom UI actions (fill input, click button, wait) to register or scrape data.
         'actions' is a list of dicts:
@@ -82,6 +129,10 @@ class WebBrowserTool:
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
+            
+            # Inject session cookies if stored in DB
+            await self._inject_cookies_if_any(context, url, user_id)
+            
             page = await context.new_page()
             
             try:

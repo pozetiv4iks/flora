@@ -143,6 +143,17 @@ class Database:
                 cursor.execute("ALTER TABLE reflection_lessons ADD COLUMN user_id INTEGER DEFAULT 0")
                 cursor.execute("UPDATE reflection_lessons SET user_id = ?", (default_uid,))
             
+            # Creation of browser_cookies table for session injection
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS browser_cookies (
+                    user_id INTEGER,
+                    domain TEXT,
+                    cookies_json TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, domain)
+                )
+            """)
+            
             conn.commit()
 
     # --- Chat History Methods ---
@@ -287,3 +298,39 @@ class Database:
                 }
                 for row in cursor.fetchall()
             ]
+
+    # --- Browser Cookies Methods (Session Injection Support) ---
+    def set_browser_cookies(self, user_id: int, domain: str, cookies_json: str):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO browser_cookies (user_id, domain, cookies_json, updated_at) VALUES (?, ?, ?, ?)",
+                (user_id, domain.lower().strip(), cookies_json, datetime.now().isoformat())
+            )
+            conn.commit()
+
+    def get_browser_cookies(self, user_id: int, domain: str) -> str:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # Clean domain
+            clean_dom = domain.lower().strip()
+            cursor.execute(
+                "SELECT cookies_json FROM browser_cookies WHERE user_id = ? AND domain = ?",
+                (user_id, clean_dom)
+            )
+            row = cursor.fetchone()
+            if row:
+                return row["cookies_json"]
+            
+            # Subdomain fallback: e.g. if we search for "www.linkedin.com" but only "linkedin.com" is stored
+            cursor.execute(
+                "SELECT domain, cookies_json FROM browser_cookies WHERE user_id = ?",
+                (user_id,)
+            )
+            rows = cursor.fetchall()
+            for r in rows:
+                stored_dom = r["domain"]
+                if clean_dom.endswith("." + stored_dom) or stored_dom.endswith("." + clean_dom):
+                    return r["cookies_json"]
+                    
+            return None

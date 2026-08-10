@@ -42,6 +42,7 @@ TOOL_PLAN_LIMITS = {
     "github_invite": {"min_plan": "owner"},
     "github_add_ssh_key": {"min_plan": "owner"},
     "github_create_repo": {"min_plan": "owner"},
+    "save_browser_cookies": {"min_plan": "pro"},
 }
 
 class FloraBrain:
@@ -54,7 +55,7 @@ class FloraBrain:
         # Initialize her powerful tools
         self.git = GitManager()
         self.indexer = CodeIndexer()
-        self.browser = WebBrowserTool()
+        self.browser = WebBrowserTool(self.db)
         self.server = ServerTool()
         self.github = GitHubTool()
 
@@ -104,7 +105,8 @@ class FloraBrain:
             "generate_ssh_key": "Генерация SSH-ключа (для привязки к внешним серверам или GitHub):\n    {{\"tool\": \"generate_ssh_key\", \"key_name\": \"id_ed25519\"}}",
             "github_invite": "Отправка инвайта (приглашения) в репозиторий GitHub для коллаборации:\n    {{\"tool\": \"github_invite\", \"repo_name\": \"имя_репозитория\", \"username\": \"логин_на_github\", \"permission\": \"push\"}}",
             "github_add_ssh_key": "Добавление публичного SSH-ключа прямо в аккаунт GitHub:\n    {{\"tool\": \"github_add_ssh_key\", \"title\": \"название_ключа\", \"key_content\": \"публичный_ключ_ssh\"}}",
-            "github_create_repo": "Создание нового репозитория на GitHub:\n    {{\"tool\": \"github_create_repo\", \"repo_name\": \"имя_нового_репозитория\", \"private\": true}}"
+            "github_create_repo": "Создание нового репозитория на GitHub:\n    {{\"tool\": \"github_create_repo\", \"repo_name\": \"имя_нового_репозитория\", \"private\": true}}",
+            "save_browser_cookies": "Сохранить сессионные куки пользователя для инжекта авторизации на сложных защищенных сайтах (например, linkedin.com, facebook.com, github.com) для обхода CAPTCHA, 2FA и защиты от ботов. Cookies должны быть в виде строки JSON-массива куков:\n    {{\"tool\": \"save_browser_cookies\", \"domain\": \"linkedin.com\", \"cookies_json\": \"[...куки в JSON...]\"}}"
         }
 
         # Dynamically build allowed tools string
@@ -269,14 +271,18 @@ class FloraBrain:
                 return json.dumps(self.indexer.search_code(tool_call["repo_name"], tool_call["query"]))
                 
             elif tool_name == "web_fetch":
-                return await self.browser.fetch_page_content(tool_call["url"])
+                return await self.browser.fetch_page_content(tool_call["url"], user_id=user_id)
                 
             elif tool_name == "web_search":
                 res = await self.browser.search_web(tool_call["query"])
                 return json.dumps(res)
                 
             elif tool_name == "web_automate":
-                return await self.browser.automate_action(tool_call["url"], tool_call["actions"])
+                return await self.browser.automate_action(tool_call["url"], tool_call["actions"], user_id=user_id)
+                
+            elif tool_name == "save_browser_cookies":
+                self.db.set_browser_cookies(user_id, tool_call["domain"], tool_call["cookies_json"])
+                return json.dumps({"success": True, "message": f"Сессионные куки для домена '{tool_call['domain']}' успешно сохранены в твою базу данных! Теперь при любом обращении к этому сайту я автоматически авторизуюсь под твоей сессией."})
                 
             elif tool_name == "save_user_fact":
                 self.db.set_user_fact(user_id, tool_call["key"], tool_call["value"])
