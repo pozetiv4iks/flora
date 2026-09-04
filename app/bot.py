@@ -14,6 +14,7 @@ from app.database import Database
 from app.brain import FloraBrain
 from app import reminder_ui as confirm_ui
 from app import file_analysis as fa
+from app.chat_context import flora_sessions, chat_queue
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,6 +93,27 @@ async def is_flora_mentioned(message: Message) -> bool:
                 mention = text[entity.offset:entity.offset + entity.length]
                 if mention.lower() == f"@{bot_username.lower()}":
                     return True
+    return False
+
+
+async def flora_send(text: str, reply_markup=None, log_history: bool = True):
+    """Write to chat without replying to a specific message."""
+    await bot.send_message(GROUP, text, reply_markup=reply_markup)
+    if log_history:
+        db.add_group_message(GROUP, "assistant", text)
+
+
+async def should_respond_to_message(message: Message, user_id: int) -> bool:
+    if await is_flora_mentioned(message):
+        return True
+    if message.reply_to_message and message.reply_to_message.from_user:
+        me = await bot.get_me()
+        if message.reply_to_message.from_user.id == me.id:
+            return True
+    if flora_sessions.is_active(user_id):
+        return True
+    if fa.get_file_wait(user_id):
+        return True
     return False
 
 
@@ -191,20 +213,21 @@ async def reminder_loop():
             logger.error(f"Error in reminder loop: {e}")
 
 
-async def process_file_analysis(message: Message, owner_id: int, file_id: int, request_text: str, sender_name: str, chat_title: str):
-    async with typing_status(bot, message.chat.id):
+async def process_file_analysis(owner_id: int, file_id: int, request_text: str, sender_name: str, chat_title: str, user_id: int):
+    async with typing_status(bot, GROUP):
         reply_text = await brain.analyze_uploaded_file(
             owner_id, file_id, request_text,
             chat_id=GROUP, sender_name=sender_name, chat_title=chat_title,
         )
-    await message.reply(reply_text)
+    flora_sessions.touch(user_id, owner_id, sender_name)
+    await flora_send(reply_text, log_history=False)
 
 
-async def process_flora_reply(message: Message, owner_id: int, user_text: str, sender_name: str, chat_title: str):
-    """Generate Flora response and attach reminder buttons when needed."""
-    async with typing_status(bot, message.chat.id):
+async def process_flora_reply(owner_id: int, user_text: str, sender_name: str, chat_title: str, user_id: int):
+    """Generate Flora response and attach confirm buttons when needed."""
+    async with typing_status(bot, GROUP):
         async def send_intermediate(t: str):
-            pass  # не шлём промежуточные «сейчас поищу» — только финальный ответ
+            pass
 
         reply_text = await brain.generate_response(
             owner_id, user_text,
@@ -215,13 +238,14 @@ async def process_flora_reply(message: Message, owner_id: int, user_text: str, s
             chat_title=chat_title,
         )
 
+    flora_sessions.touch(user_id, owner_id, sender_name)
+
     pending_save = brain.pop_pending_save()
+    markup = confirm_ui.kb_save_confirm() if pending_save else None
     if pending_save:
-        confirm_ui.store_pending(message.from_user.id, pending_save)
-        markup = confirm_ui.kb_save_confirm()
-    else:
-        markup = None
-    await message.reply(reply_text, reply_markup=markup)
+        confirm_ui.store_pending(user_id, pending_save)
+
+    await flora_send(reply_text, reply_markup=markup, log_history=False)
 
     pending = brain.pop_file_to_send()
     if pending:
@@ -229,7 +253,8 @@ async def process_flora_reply(message: Message, owner_id: int, user_text: str, s
         record = db.get_user_file(file_owner_id, file_id=file_id)
         if record and os.path.exists(record["local_path"]):
             try:
-                await message.reply_document(
+                await bot.send_document(
+                    GROUP,
                     FSInputFile(record["local_path"], filename=record["original_name"]),
                     caption=f"📎 {record['original_name']}",
                 )
@@ -321,7 +346,8 @@ async def on_confirm_save_callback(callback: CallbackQuery):
 
         if action == "replace":
             confirm_ui.clear_pending(user_id)
-            await callback.message.edit_text("Ок, напиши Flora что изменить — переделаю.")
+            flora_sessions.touch(user_id, owner_id, callback.from_user.first_name or "участник")
+            await callback.message.edit_text("Ок, напиши что изменить — переделаю.")
             await callback.answer()
             return
 
@@ -361,14 +387,13 @@ async def cmd_start(message: Message):
         "Живу только в этом чате. Обращайся по имени или @упоминанию.\n"
         "Заметки, планы, расписание, поиск, сленг — всё тут."
     )
-    db.add_group_message(GROUP, "assistant", welcome_text)
-    await message.reply(welcome_text)
+    await flora_send(welcome_text)
 
 
 @dp.message(Command("clear"), F.chat.id == GROUP)
 async def cmd_clear(message: Message):
     db.clear_group_chat_history(GROUP)
-    await message.reply("История с Flora очищена. Планы и заметки на месте.")
+    await flora_send("История с Flora очищена. Планы и заметки на месте.")
 
 
 @dp.message(Command("status"), F.chat.id == GROUP)
@@ -378,11 +403,90 @@ async def cmd_status(message: Message):
     pending = db.list_plan_items(owner_id, status="pending", limit=100)
     slang = db.get_slang_words(owner_id, limit=5)
     style = user_facts.get("Стиль общения", "ещё изучаю")
-    await message.reply(
+    await flora_send(
         f"Активных планов: {len(pending)}\n"
         f"Сленга в памяти: {len(slang)}\n"
         f"Стиль: {style[:100]}"
     )
+
+
+
+async def _handle_user_message(message: Message):
+    text = message.text or message.caption or ""
+    has_attachment = bool(message.document or message.photo)
+    owner_id = resolve_owner_user_id(message)
+    sender_name = message.from_user.first_name or message.from_user.username or "участник"
+    chat_title = message.chat.title or "группа"
+    user_id = message.from_user.id
+
+    saved = None
+    if has_attachment:
+        saved = await save_telegram_attachment(message, owner_id)
+        if saved and saved.get("success"):
+            fa.set_recent_file(user_id, owner_id, saved)
+
+    # Ждём следующее сообщение после просьбы про файл
+    file_wait = fa.get_file_wait(user_id)
+    if file_wait:
+        if has_attachment and saved and saved.get("success"):
+            wait = fa.pop_file_wait(user_id)
+            await process_file_analysis(
+                owner_id, saved["file_id"],
+                wait.get("request_text", "") if wait else text,
+                sender_name, chat_title, user_id,
+            )
+            return
+        if text.strip() and not has_attachment:
+            await flora_send("Это не файл 📎 Скинь документ, таблицу (csv/xlsx) или pdf.")
+            return
+        if has_attachment and saved and saved.get("error"):
+            await flora_send(f"Не смогла принять файл: {saved['error']}")
+        return
+
+    if not await should_respond_to_message(message, user_id):
+        return
+
+    flora_sessions.touch(user_id, owner_id, sender_name)
+
+    # Просьба про файл без вложения — ждём следующее сообщение (без «скидывай»)
+    if fa.wants_file_action(text) and not has_attachment:
+        recent = fa.get_recent_file(user_id)
+        if recent:
+            await process_file_analysis(
+                owner_id, recent["file_id"], text,
+                sender_name, chat_title, user_id,
+            )
+            return
+        fa.start_file_wait(user_id, owner_id, text, sender_name)
+        return
+
+    if has_attachment and saved:
+        if saved.get("error"):
+            await flora_send(f"Не смогла принять файл: {saved['error']}")
+            return
+        if saved.get("success") and (fa.wants_file_action(text) or fa.get_file_wait(user_id)):
+            await process_file_analysis(owner_id, saved["file_id"], text, sender_name, chat_title, user_id)
+            return
+
+        preview = saved.get("preview")
+        file_note = (
+            f"\n[Файл загружен: id={saved['file_id']}, имя={saved['name']}, "
+            f"размер={saved.get('size', '?')} байт"
+        )
+        if preview:
+            file_note += f", начало текста: {preview[:300]}"
+        file_note += "]"
+        user_text = (text + file_note).strip()
+    else:
+        user_text = text.strip()
+
+    if not user_text:
+        if saved and saved.get("success"):
+            user_text = f"Прикрепил файл {saved['name']} (id={saved['file_id']})."
+        else:
+            return
+
+    await process_flora_reply(owner_id, user_text, sender_name, chat_title, user_id)
 
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
@@ -398,10 +502,9 @@ async def handle_group_message(message: types.Message):
 
     owner_id = resolve_owner_user_id(message)
     sender_name = message.from_user.first_name or message.from_user.username or "участник"
-    chat_title = message.chat.title or "группа"
     user_id = message.from_user.id
 
-    db.register_group_chat(GROUP, owner_id, chat_title)
+    db.register_group_chat(GROUP, owner_id, message.chat.title or "группа")
 
     log_text = text or ("[файл]" if has_attachment else "")
     if log_text:
@@ -409,65 +512,14 @@ async def handle_group_message(message: types.Message):
         if msg_count % 20 == 0:
             asyncio.create_task(brain.analyze_group_chat(owner_id, GROUP))
 
-    # Ожидаем файл от пользователя (после «проанализируй файл»)
-    file_wait = fa.get_file_wait(user_id)
-    if file_wait:
-        if has_attachment:
-            saved = await save_telegram_attachment(message, owner_id)
-            if saved and saved.get("error"):
-                await message.reply(f"Не смогла принять файл: {saved['error']}")
-                return
-            if saved and saved.get("success"):
-                wait = fa.pop_file_wait(user_id)
-                await process_file_analysis(
-                    message, owner_id, saved["file_id"],
-                    wait.get("request_text", "") if wait else "",
-                    sender_name, chat_title,
-                )
-            return
-        if text.strip():
-            await message.reply("Это не файл 📎 Скинь документ, таблицу (csv/xlsx) или pdf.")
-            return
-        return
-
-    if not await is_flora_mentioned(message):
-        return
-
-    # «Flora, проанализируй файл» — ждём следующее сообщение с файлом
-    if fa.wants_file_analysis_request(text) and not has_attachment:
-        fa.start_file_wait(user_id, owner_id, text, sender_name)
-        db.add_group_message(GROUP, "assistant", "Хорошо, скидывай файл 📎")
-        await message.reply("Хорошо, скидывай файл 📎")
-        return
-
-    file_note = ""
-    saved = None
-    if has_attachment:
+    # Файл без упоминания — запоминаем на случай просьбы следом
+    if has_attachment and not await should_respond_to_message(message, user_id):
         saved = await save_telegram_attachment(message, owner_id)
-        if saved and saved.get("error"):
-            await message.reply(f"Не смогла принять файл: {saved['error']}")
-            return
         if saved and saved.get("success"):
-            if fa.wants_file_analysis_request(text) or any(w in text.lower() for w in ("проанализиру", "разбери", "анализ")):
-                await process_file_analysis(message, owner_id, saved["file_id"], text, sender_name, chat_title)
-                return
-            preview = saved.get("preview")
-            file_note = (
-                f"\n[Файл загружен: id={saved['file_id']}, имя={saved['name']}, "
-                f"размер={saved.get('size', '?')} байт"
-            )
-            if preview:
-                file_note += f", начало текста: {preview[:300]}"
-            file_note += "]"
-
-    user_text = (text + file_note).strip()
-    if not user_text and saved and saved.get("success"):
-        user_text = f"Пользователь прикрепил файл {saved['name']} (id={saved['file_id']}). Что с ним сделать?"
-
-    if not user_text:
+            fa.set_recent_file(user_id, owner_id, saved)
         return
 
-    await process_flora_reply(message, owner_id, user_text, sender_name, chat_title)
+    chat_queue.enqueue(_handle_user_message(message))
 
 
 @dp.message(F.chat.type == "private")
@@ -485,6 +537,7 @@ async def main():
     if Config.ALLOWED_USER_IDS:
         db.register_group_chat(GROUP, Config.ALLOWED_USER_IDS[0], "Flora group")
 
+    chat_queue.start()
     reminder_task = asyncio.create_task(reminder_loop())
     try:
         await dp.start_polling(bot)
