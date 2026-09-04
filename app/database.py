@@ -152,10 +152,16 @@ class Database:
                     description TEXT,
                     plan_date TEXT,
                     status TEXT DEFAULT 'pending',
+                    reminded INTEGER DEFAULT 0,
+                    remind_at_time TEXT DEFAULT '09:00',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     completed_at DATETIME
                 )
             """)
+            cursor.execute("PRAGMA table_info(plan_items)")
+            plan_columns = [row[1] for row in cursor.fetchall()]
+            if plan_columns and "reminded" not in plan_columns:
+                cursor.execute("ALTER TABLE plan_items ADD COLUMN reminded INTEGER DEFAULT 0")
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS schedule_events (
@@ -166,9 +172,19 @@ class Database:
                     title TEXT NOT NULL,
                     description TEXT,
                     reminded INTEGER DEFAULT 0,
+                    remind_minutes_before INTEGER DEFAULT 30,
+                    remind_at_time TEXT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cursor.execute("PRAGMA table_info(schedule_events)")
+            sched_columns = [row[1] for row in cursor.fetchall()]
+            if sched_columns and "remind_minutes_before" not in sched_columns:
+                cursor.execute("ALTER TABLE schedule_events ADD COLUMN remind_minutes_before INTEGER DEFAULT 30")
+            if sched_columns and "remind_at_time" not in sched_columns:
+                cursor.execute("ALTER TABLE schedule_events ADD COLUMN remind_at_time TEXT")
+            if plan_columns and "remind_at_time" not in plan_columns:
+                cursor.execute("ALTER TABLE plan_items ADD COLUMN remind_at_time TEXT DEFAULT '09:00'")
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS group_chats (
@@ -380,12 +396,12 @@ class Database:
             return cursor.rowcount > 0
 
     # --- Plan Items ---
-    def add_plan_item(self, user_id: int, title: str, description: str = None, plan_date: str = None) -> int:
+    def add_plan_item(self, user_id: int, title: str, description: str = None, plan_date: str = None, remind_at_time: str = None) -> int:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO plan_items (user_id, title, description, plan_date, status) VALUES (?, ?, ?, ?, 'pending')",
-                (user_id, title, description, plan_date)
+                "INSERT INTO plan_items (user_id, title, description, plan_date, status, remind_at_time) VALUES (?, ?, ?, ?, 'pending', ?)",
+                (user_id, title, description, plan_date, remind_at_time or "09:00")
             )
             conn.commit()
             return cursor.lastrowid
@@ -440,12 +456,18 @@ class Database:
             return cursor.rowcount > 0
 
     # --- Schedule Events ---
-    def add_schedule_event(self, user_id: int, event_date: str, title: str, event_time: str = None, description: str = None) -> int:
+    def add_schedule_event(
+        self, user_id: int, event_date: str, title: str,
+        event_time: str = None, description: str = None,
+        remind_minutes_before: int = None, remind_at_time: str = None
+    ) -> int:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO schedule_events (user_id, event_date, event_time, title, description) VALUES (?, ?, ?, ?, ?)",
-                (user_id, event_date, event_time, title, description)
+                """INSERT INTO schedule_events
+                   (user_id, event_date, event_time, title, description, remind_minutes_before, remind_at_time)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, event_date, event_time, title, description, remind_minutes_before or 30, remind_at_time)
             )
             conn.commit()
             return cursor.lastrowid
@@ -476,14 +498,15 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                """SELECT id, user_id, event_date, event_time, title, description FROM schedule_events
+                """SELECT id, user_id, event_date, event_time, title, description,
+                          remind_minutes_before, remind_at_time FROM schedule_events
                    WHERE user_id = ? AND reminded = 0 AND event_date IN (?, ?)
                    ORDER BY event_date ASC, event_time ASC""",
                 (user_id, today, tomorrow)
             )
             return [dict(row) for row in cursor.fetchall()]
 
-    def get_all_upcoming_unreminded_events(self) -> list:
+    def get_all_unreminded_events(self) -> list:
         from datetime import timedelta
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
@@ -491,12 +514,35 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                """SELECT id, user_id, event_date, event_time, title, description FROM schedule_events
+                """SELECT id, user_id, event_date, event_time, title, description,
+                          remind_minutes_before, remind_at_time FROM schedule_events
                    WHERE reminded = 0 AND event_date IN (?, ?)
                    ORDER BY user_id, event_date ASC, event_time ASC""",
                 (today, tomorrow)
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_plans_to_remind(self) -> list:
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT id, user_id, title, description, plan_date, remind_at_time FROM plan_items
+                   WHERE status = 'pending' AND reminded = 0 AND plan_date = ?
+                   ORDER BY user_id, id ASC""",
+                (today,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def mark_plan_reminded(self, plan_id: int):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE plan_items SET reminded = 1 WHERE id = ?", (plan_id,))
+            conn.commit()
+
+    def get_all_upcoming_unreminded_events(self) -> list:
+        """Backward-compatible alias."""
+        return self.get_all_unreminded_events()
 
     def mark_event_reminded(self, event_id: int):
         with self._get_connection() as conn:

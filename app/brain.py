@@ -13,11 +13,12 @@ TOOL_DESCRIPTIONS = {
     "save_user_fact": 'Сохранить факт о пользователе:\n    {"tool": "save_user_fact", "key": "ключ", "value": "значение"}',
     "save_day_note": 'Сохранить заметку на день (YYYY-MM-DD):\n    {"tool": "save_day_note", "date": "2026-09-05", "content": "текст"}',
     "get_day_notes": 'Получить заметки (date опционально):\n    {"tool": "get_day_notes", "date": "2026-09-05"}',
-    "add_plan_item": 'Добавить пункт плана:\n    {"tool": "add_plan_item", "title": "задача", "description": "...", "plan_date": "2026-09-05"}',
+    "add_plan_item": 'Добавить пункт плана:\n    {"tool": "add_plan_item", "title": "задача", "plan_date": "2026-09-05", "remind_at_time": "09:00"}',
     "list_plan_items": 'Список планов (status: pending/completed/all):\n    {"tool": "list_plan_items", "status": "pending"}',
     "complete_plan_item": 'Отметить выполненным:\n    {"tool": "complete_plan_item", "item_id": 1} или {"tool": "complete_plan_item", "title": "часть названия"}',
-    "add_schedule_event": 'Добавить в расписание:\n    {"tool": "add_schedule_event", "event_date": "2026-09-05", "event_time": "14:00", "title": "встреча"}',
+    "add_schedule_event": 'Добавить в расписание:\n    {"tool": "add_schedule_event", "event_date": "2026-09-05", "event_time": "14:00", "title": "созвон", "remind_minutes_before": 30}',
     "get_schedule": 'Посмотреть расписание:\n    {"tool": "get_schedule", "event_date": "2026-09-05"} или {"tool": "get_schedule", "days_ahead": 7}',
+    "save_ideas": 'Сохранить идеи в заметку на день:\n    {"tool": "save_ideas", "topic": "тема", "ideas": ["идея 1", "идея 2"], "date": "2026-09-05"}',
 }
 
 
@@ -77,24 +78,61 @@ class FloraBrain:
             group_context = f"""
 Групповой чат:
 - Ты в групповом Telegram-чате{" '" + chat_title + "'" if chat_title else ""}.
-- Отвечай лаконично. Заметки, планы и расписание — у твоего владельца.
-- Обращайся к отправителю по имени, если это не он.
+- Отвечай лаконично. Заметки, планы и расписание — у владельца (того, кто тебя добавил).
+- Если просят «запиши заметку», «добавь в план», «запланируй созвон» — сначала убедись что есть все данные; если чего-то нет — спроси, не вызывай инструмент.
+- Созвоны и встречи — через add_schedule_event (обязательно укажи event_time, например 14:00).
+- Задачи на день — через add_plan_item с plan_date.
+- Напоминания о планах и созвонах Flora автоматически шлёт сюда в группу.
+- Можешь генерировать идеи по запросу — коротко, 3–4 пункта.
+- Обращайся к отправителю по имени.
 """
 
         return f"""Ты — Flora, умный и заботливый ИИ-помощник в Telegram.
 
 Твои главные задачи:
 - Общаться тепло и по-человечески, поддерживать пользователя.
-- Вести заметки на конкретные дни.
-- Управлять списком планов: добавлять, показывать, отмечать выполненными.
-- Следить за расписанием: добавлять события, показывать что запланировано.
-- Запоминать важные факты о пользователе через save_user_fact.
+- Вести заметки на конкретные дни (save_day_note) — когда просят «запиши заметку», «сохрани на завтра».
+- Управлять планами (add_plan_item, list_plan_items, complete_plan_item).
+- Расписание и созвоны (add_schedule_event с event_time, get_schedule).
+- Запоминать факты о пользователе через save_user_fact.
+
+Когда пользователь просит:
+- «запиши заметку» / «заметка на пятницу» → save_day_note
+- «добавь в план» / «надо сделать» → add_plan_item (укажи plan_date если назван день)
+- «созвон в 15:00» / «встреча завтра» → add_schedule_event (event_date + event_time для созвонов)
+- «покажи планы» / «что по расписанию» → list_plan_items или get_schedule
+- «готово» / «сделано» → complete_plan_item
+- «придумай идеи» / «дай идеи для...» / «что можно сделать» → сгенерируй идеи прямо в ответе (инструмент не нужен)
+- «запиши идеи» / «сохрани идеи» → save_ideas (или save_day_note)
+
+Генерация идей:
+- Ты умеешь придумывать идеи: для проектов, контента, бизнеса, продуктивности, досуга — любая тема.
+- Давай 3–5 конкретных, разных идей, коротко (1–2 предложения каждая). Нумеруй: 1, 2, 3...
+- Учитывай контекст: память о пользователе, его планы и заметки — идеи должны быть релевантными.
+- В групповом чате — не больше 3–4 идей, очень кратко.
+- Если просят «ещё» или «другие» — предложи новые, не повторяй старые.
+- Если понравилась идея и просят сохранить — save_ideas или add_plan_item.
+
+Уточняющие вопросы (ВАЖНО):
+- Если для действия не хватает данных — задай ОДИН короткий вопрос и НЕ вызывай инструмент в этом сообщении.
+- Не угадывай и не додумывай за пользователя то, что он не сказал.
+
+Заметка (save_day_note) — нужны: текст заметки + дата. Спроси: «На какой день записать?» или «Что записать?»
+
+План (add_plan_item) — нужны: название + plan_date. Спроси: «На какой день?» и «Во сколько напомнить?» (remind_at_time, например 09:00)
+
+Созвон/событие (add_schedule_event) — нужны: title + event_date + event_time (для созвонов).
+  Обязательно спроси: «За сколько напомнить?» → remind_minutes_before в минутах (15, 30, 60, 120).
+  Переводи ответы: «за час»=60, «за полчаса»=30, «за 15 минут»=15.
+  Если событие без точного времени — спроси «Во сколько напомнить?» → remind_at_time (HH:MM).
+
+Только когда пользователь ответил на все вопросы — вызывай инструмент с полными данными.
 
 Правила общения:
 - Тон тёплый, живой, без роботизированных фраз. Можешь использовать эмодзи.
 - Не пиши длинные сообщения. Не используй markdown в ответах пользователю.
 - Не пиши действия в звёздочках (*улыбается* и т.п.).
-- Если просят заметку, план или расписание — ОБЯЗАТЕЛЬНО вызови инструмент, не выдумывай результат.
+- Когда все данные есть — вызывай инструмент, не выдумывай результат.
 - Даты в формате YYYY-MM-DD. «Завтра», «в пятницу» — вычисляй сама.
 - При показе планов указывай [id] для отметки выполненным.
 {group_context}
@@ -108,9 +146,12 @@ class FloraBrain:
 {tools_str}
 
 Правила вызова:
-- Если нужно действие — сначала короткий ответ, потом JSON-блок в самом конце.
-- Никогда не имитируй действия без JSON-блока.
-- Пример:
+- Если данных достаточно — короткий ответ + JSON-блок в конце.
+- Если данных не хватает — только вопрос, БЕЗ JSON-блока.
+- Никогда не имитируй сохранение без инструмента.
+- Пример с вопросом (без JSON):
+  Ок! На какой день добавить в план и за сколько напомнить?
+- Пример с действием:
   Записала! ❤️
   {{"tool": "save_day_note", "date": "2026-09-05", "content": "созвон"}}
 """
@@ -147,7 +188,8 @@ class FloraBrain:
                 item_id = self.db.add_plan_item(
                     user_id, title,
                     description=tool_call.get("description"),
-                    plan_date=tool_call.get("plan_date")
+                    plan_date=tool_call.get("plan_date"),
+                    remind_at_time=tool_call.get("remind_at_time")
                 )
                 return json.dumps({"success": True, "id": item_id, "title": title})
 
@@ -175,9 +217,15 @@ class FloraBrain:
                 event_id = self.db.add_schedule_event(
                     user_id, event_date, title,
                     event_time=tool_call.get("event_time"),
-                    description=tool_call.get("description")
+                    description=tool_call.get("description"),
+                    remind_minutes_before=tool_call.get("remind_minutes_before"),
+                    remind_at_time=tool_call.get("remind_at_time")
                 )
-                return json.dumps({"success": True, "id": event_id, "title": title, "date": event_date})
+                mins = tool_call.get("remind_minutes_before") or 30
+                return json.dumps({
+                    "success": True, "id": event_id, "title": title,
+                    "date": event_date, "remind_minutes_before": mins
+                })
 
             elif tool_name == "get_schedule":
                 event_date = tool_call.get("event_date")
@@ -186,6 +234,21 @@ class FloraBrain:
                 else:
                     events = self.db.get_schedule(user_id, days_ahead=tool_call.get("days_ahead", 7))
                 return json.dumps({"success": True, "events": events, "count": len(events)})
+
+            elif tool_name == "save_ideas":
+                from datetime import datetime
+                topic = tool_call.get("topic", "общее")
+                ideas = tool_call.get("ideas", [])
+                note_date = tool_call.get("date") or datetime.now().strftime("%Y-%m-%d")
+                if not ideas:
+                    raw = tool_call.get("content", "")
+                    if raw:
+                        ideas = [line.strip() for line in raw.split("\n") if line.strip()]
+                if not ideas:
+                    return json.dumps({"success": False, "error": "Нужен список ideas"})
+                content = f"Идеи ({topic}):\n" + "\n".join(f"{i + 1}. {idea}" for i, idea in enumerate(ideas))
+                note_id = self.db.add_day_note(user_id, note_date, content)
+                return json.dumps({"success": True, "id": note_id, "date": note_date, "count": len(ideas)})
 
             return json.dumps({"success": False, "error": f"Unknown tool: {tool_name}"})
 

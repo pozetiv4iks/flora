@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
@@ -95,31 +96,116 @@ async def is_flora_mentioned(message: Message) -> bool:
     return False
 
 
-async def schedule_reminder_loop():
+def _parse_event_time(event_time: str):
+    if not event_time:
+        return None
+    try:
+        parts = event_time.strip().split(":")
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+        return hour, minute
+    except (ValueError, IndexError):
+        return None
+
+
+def _is_in_remind_window(now: datetime, target_h: int, target_m: int, grace_minutes: int = 10) -> bool:
+    target = now.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
+    return target <= now <= target + timedelta(minutes=grace_minutes)
+
+
+def should_remind_plan(plan: dict) -> bool:
+    now = datetime.now()
+    if plan.get("plan_date") != now.strftime("%Y-%m-%d"):
+        return False
+    parsed = _parse_event_time(plan.get("remind_at_time") or "09:00")
+    if not parsed:
+        return now.hour >= 9 and now.hour < 10
+    return _is_in_remind_window(now, parsed[0], parsed[1])
+
+
+def should_remind_schedule_event(event: dict) -> bool:
+    """Decide if a schedule event should fire now."""
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    event_date = event.get("event_date")
+
+    if event_date not in (today, tomorrow):
+        return False
+
+    parsed_event = _parse_event_time(event.get("event_time"))
+    if parsed_event and event_date == today:
+        hour, minute = parsed_event
+        event_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        minutes_before = event.get("remind_minutes_before") or 30
+        window_start = event_dt - timedelta(minutes=minutes_before)
+        window_end = event_dt + timedelta(minutes=10)
+        return window_start <= now <= window_end
+
+    if event_date == tomorrow and not event.get("event_time"):
+        remind_at = _parse_event_time(event.get("remind_at_time") or "20:00")
+        if remind_at:
+            return _is_in_remind_window(now, remind_at[0], remind_at[1])
+        return now.hour >= 20 and now.hour < 21
+
+    if event_date == today:
+        remind_at = _parse_event_time(event.get("remind_at_time") or "09:00")
+        if remind_at:
+            return _is_in_remind_window(now, remind_at[0], remind_at[1])
+        return now.hour >= 9 and now.hour < 10
+
+    return False
+
+
+async def send_reminder(user_id: int, text: str):
+    """Send reminder to owner in DM and to all registered group chats."""
+    try:
+        await bot.send_message(user_id, text)
+    except Exception as e:
+        logger.error(f"Failed to DM reminder to {user_id}: {e}")
+
+    for gc in db.get_registered_group_chats(user_id):
+        try:
+            await bot.send_message(gc["chat_id"], text)
+        except Exception as e:
+            logger.error(f"Failed to send group reminder to {gc['chat_id']}: {e}")
+
+
+async def reminder_loop():
+    """Remind about plans and scheduled calls/meetings in DM and group chats."""
     while True:
         try:
-            await asyncio.sleep(1800)
-            events = db.get_all_upcoming_unreminded_events()
-            for event in events:
-                user_id = event["user_id"]
+            await asyncio.sleep(300)
+
+            for plan in db.get_plans_to_remind():
+                if not should_remind_plan(plan):
+                    continue
+                text = f"📋 Напоминание по плану: {plan['title']}"
+                if plan.get("description"):
+                    text += f"\n{plan['description']}"
+                await send_reminder(plan["user_id"], text)
+                db.mark_plan_reminded(plan["id"])
+
+            for event in db.get_all_unreminded_events():
+                if not should_remind_schedule_event(event):
+                    continue
                 time_str = f" в {event['event_time']}" if event.get("event_time") else ""
-                reminder = f"Напоминание: {event['title']}{time_str} ({event['event_date']})"
+                label = "созвон" if any(w in event["title"].lower() for w in ("созвон", "call", "zoom", "meet")) else "событие"
+                text = f"📅 Напоминание — {label}: {event['title']}{time_str}"
                 if event.get("description"):
-                    reminder += f"\n{event['description']}"
-                try:
-                    await bot.send_message(user_id, reminder)
-                    for gc in db.get_registered_group_chats(user_id):
-                        try:
-                            await bot.send_message(gc["chat_id"], f"Flora: {reminder}")
-                        except Exception:
-                            pass
-                    db.mark_event_reminded(event["id"])
-                except Exception as e:
-                    logger.error(f"Failed to send reminder to {user_id}: {e}")
+                    text += f"\n{event['description']}"
+                await send_reminder(event["user_id"], text)
+                db.mark_event_reminded(event["id"])
+
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Error in schedule reminder loop: {e}")
+            logger.error(f"Error in reminder loop: {e}")
+
+
+async def schedule_reminder_loop():
+    """Alias for backward compatibility."""
+    await reminder_loop()
 
 
 @dp.message(CommandStart())
@@ -133,7 +219,7 @@ async def cmd_start(message: Message):
 
     welcome_text = (
         f"Привет, {first_name}! Я Flora ✨\n\n"
-        "Я твой помощник: заметки на дни, планы, расписание — всё в чате. "
+        "Я твой помощник: заметки, планы, расписание, идеи — всё в чате. "
         "В группе обращайся ко мне по имени или через @упоминание.\n\n"
         "Чем могу помочь?"
     )
@@ -299,7 +385,7 @@ async def main():
     bot_username = me.username or ""
     logger.info(f"Bot username: @{bot_username}")
 
-    reminder_task = asyncio.create_task(schedule_reminder_loop())
+    reminder_task = asyncio.create_task(reminder_loop())
     try:
         await dp.start_polling(bot)
     finally:
