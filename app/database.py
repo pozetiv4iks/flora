@@ -227,6 +227,19 @@ class Database:
                     UNIQUE(owner_user_id, word)
                 )
             """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    telegram_file_id TEXT,
+                    local_path TEXT NOT NULL,
+                    original_name TEXT NOT NULL,
+                    mime_type TEXT,
+                    size INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             
             conn.commit()
 
@@ -663,3 +676,57 @@ class Database:
                 (owner_user_id, limit)
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    # --- User Files ---
+    def add_user_file(
+        self,
+        user_id: int,
+        telegram_file_id: str,
+        local_path: str,
+        original_name: str,
+        mime_type: str = None,
+        size: int = None,
+    ) -> int:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO user_files (user_id, telegram_file_id, local_path, original_name, mime_type, size, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, telegram_file_id, local_path, original_name, mime_type, size, datetime.now().isoformat()),
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_user_file(self, user_id: int, file_id: int = None, filename: str = None) -> dict | None:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if file_id:
+                cursor.execute(
+                    "SELECT * FROM user_files WHERE user_id = ? AND id = ?",
+                    (user_id, file_id),
+                )
+            elif filename:
+                cursor.execute(
+                    "SELECT * FROM user_files WHERE user_id = ? AND original_name = ? ORDER BY id DESC LIMIT 1",
+                    (user_id, filename),
+                )
+            else:
+                return None
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def list_user_files(self, user_id: int, limit: int = 50) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT id, original_name, mime_type, size, created_at
+                   FROM user_files WHERE user_id = ? ORDER BY id DESC LIMIT ?""",
+                (user_id, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def delete_user_file(self, user_id: int, file_id: int):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM user_files WHERE user_id = ? AND id = ?", (user_id, file_id))
+            conn.commit()

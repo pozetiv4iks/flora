@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import os
 import sys
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
+from pathlib import Path
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, FSInputFile
 from app.config import Config
 from app.database import Database
 from app.brain import FloraBrain
@@ -207,6 +209,65 @@ async def process_flora_reply(message: Message, owner_id: int, user_text: str, s
         rw.start_session(message.from_user.id)
     await message.reply(reply_text, reply_markup=markup)
 
+    pending = brain.pop_file_to_send()
+    if pending:
+        file_owner_id, file_id = pending
+        record = db.get_user_file(file_owner_id, file_id=file_id)
+        if record and os.path.exists(record["local_path"]):
+            try:
+                await message.reply_document(
+                    FSInputFile(record["local_path"], filename=record["original_name"]),
+                    caption=f"📎 {record['original_name']}",
+                )
+            except Exception as e:
+                logger.error(f"Failed to send file to chat: {e}")
+
+
+async def save_telegram_attachment(message: Message, owner_id: int) -> dict | None:
+    """Download document or photo from Telegram into user sandbox."""
+    tg_file = None
+    original_name = None
+    mime_type = None
+    size = None
+    telegram_file_id = None
+
+    if message.document:
+        doc = message.document
+        original_name = doc.file_name or f"file_{doc.file_id}"
+        mime_type = doc.mime_type
+        size = doc.file_size
+        telegram_file_id = doc.file_id
+        if size and size > Config.MAX_FILE_SIZE_BYTES:
+            return {"error": f"Файл слишком большой (лимит {Config.MAX_FILE_SIZE_BYTES // 1024 // 1024} МБ)"}
+        ext = Path(original_name).suffix.lower()
+        if ext and ext not in Config.ALLOWED_FILE_EXTENSIONS:
+            return {"error": f"Тип файла {ext} не разрешён"}
+        tg_file = await bot.get_file(doc.file_id)
+    elif message.photo:
+        photo = message.photo[-1]
+        size = photo.file_size
+        telegram_file_id = photo.file_id
+        if size and size > Config.MAX_FILE_SIZE_BYTES:
+            return {"error": "Фото слишком большое"}
+        original_name = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        mime_type = "image/jpeg"
+        tg_file = await bot.get_file(photo.file_id)
+    else:
+        return None
+
+    user_dir = os.path.join(Config.UPLOADS_DIR, str(owner_id))
+    os.makedirs(user_dir, exist_ok=True)
+    safe_name = Path(original_name).name
+    local_path = os.path.join(user_dir, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_name}")
+    await bot.download_file(tg_file.file_path, local_path)
+
+    return brain.files.register_download(
+        owner_id, local_path, safe_name,
+        telegram_file_id=telegram_file_id,
+        mime_type=mime_type,
+        size=size or os.path.getsize(local_path),
+    )
+
 
 def _wants_reminder_wizard(text: str) -> bool:
     lower = text.lower()
@@ -384,8 +445,10 @@ async def handle_group_message(message: types.Message):
     if not is_allowed_group(message.chat.id):
         return
 
-    text = message.text or message.caption
-    if not text:
+    text = message.text or message.caption or ""
+    has_attachment = bool(message.document or message.photo)
+
+    if not text and not has_attachment:
         return
 
     owner_id = resolve_owner_user_id(message)
@@ -394,11 +457,37 @@ async def handle_group_message(message: types.Message):
 
     db.register_group_chat(GROUP, owner_id, chat_title)
 
-    msg_count = db.log_group_message(GROUP, sender_name, text)
-    if msg_count % 20 == 0:
-        asyncio.create_task(brain.analyze_group_chat(owner_id, GROUP))
+    log_text = text or ("[файл]" if has_attachment else "")
+    if log_text:
+        msg_count = db.log_group_message(GROUP, sender_name, log_text)
+        if msg_count % 20 == 0:
+            asyncio.create_task(brain.analyze_group_chat(owner_id, GROUP))
 
     if not await is_flora_mentioned(message):
+        return
+
+    file_note = ""
+    saved = None
+    if has_attachment:
+        saved = await save_telegram_attachment(message, owner_id)
+        if saved and saved.get("error"):
+            await message.reply(f"Не смогла принять файл: {saved['error']}")
+            return
+        if saved and saved.get("success"):
+            preview = saved.get("preview")
+            file_note = (
+                f"\n[Файл загружен: id={saved['file_id']}, имя={saved['name']}, "
+                f"размер={saved.get('size', '?')} байт"
+            )
+            if preview:
+                file_note += f", начало текста: {preview[:300]}"
+            file_note += "]"
+
+    user_text = (text + file_note).strip()
+    if not user_text and saved and saved.get("success"):
+        user_text = f"Пользователь прикрепил файл {saved['name']} (id={saved['file_id']}). Что с ним сделать?"
+
+    if not user_text:
         return
 
     if _wants_reminder_wizard(text):
@@ -406,7 +495,7 @@ async def handle_group_message(message: types.Message):
         await message.reply("Какое напоминание?", reply_markup=rw.kb_remind_type())
         return
 
-    await process_flora_reply(message, owner_id, text, sender_name, chat_title)
+    await process_flora_reply(message, owner_id, user_text, sender_name, chat_title)
 
 
 @dp.message(F.chat.type == "private")

@@ -36,6 +36,20 @@ class Config:
     # Единственная группа, где Flora отвечает
     ALLOWED_GROUP_CHAT_ID = -5377044950
 
+    UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
+    MAX_FILE_SIZE_BYTES = int(os.getenv("MAX_FILE_SIZE_MB", "5")) * 1024 * 1024
+    MAX_FILE_READ_CHARS = int(os.getenv("MAX_FILE_READ_CHARS", "15000"))
+
+    _file_perms_str = os.getenv("FILE_PERMISSIONS", "read,write,list,delete")
+    FILE_PERMISSIONS = {p.strip().lower() for p in _file_perms_str.split(",") if p.strip()}
+
+    _ext_str = os.getenv(
+        "ALLOWED_FILE_EXTENSIONS",
+        ".txt,.md,.json,.csv,.yaml,.yml,.xml,.html,.py,.js,.ts,.pdf,.log,.env,.rtf,.jpg,.jpeg,.png,.webp",
+    )
+    ALLOWED_FILE_EXTENSIONS = {e.strip().lower() if e.strip().startswith(".") else f".{e.strip().lower()}"
+                               for e in _ext_str.split(",") if e.strip()}
+
     @classmethod
     def validate(cls):
         """Validate required configuration variables."""

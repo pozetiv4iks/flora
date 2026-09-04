@@ -7,6 +7,8 @@ import httpx
 from app.config import Config
 from app.database import Database
 from app.tools.browser_tool import WebBrowserTool
+from app.tools.file_tool import FileTool
+from app.file_permissions import filter_tool_descriptions, is_file_tool_allowed, permissions_summary
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,11 @@ TOOL_DESCRIPTIONS = {
     "web_search": 'Поиск в браузере/интернете:\n    {"tool": "web_search", "query": "поисковый запрос"}',
     "save_slang_word": 'Запомнить сленг/слово чата:\n    {"tool": "save_slang_word", "word": "слово", "meaning": "значение", "usage_example": "пример"}',
     "list_slang_words": 'Показать сохранённый сленг:\n    {"tool": "list_slang_words"}',
+    "list_user_files": 'Список загруженных файлов пользователя:\n    {"tool": "list_user_files"}',
+    "read_user_file": 'Прочитать файл (по id или имени):\n    {"tool": "read_user_file", "file_id": 1} или {"tool": "read_user_file", "filename": "notes.txt"}',
+    "write_user_file": 'Создать/перезаписать текстовый файл:\n    {"tool": "write_user_file", "filename": "report.md", "content": "текст", "send_to_chat": true}',
+    "save_text_as_file": 'Сохранить текст в файл (алиас write_user_file):\n    {"tool": "save_text_as_file", "filename": "ideas.txt", "content": "текст", "send_to_chat": false}',
+    "delete_user_file": 'Удалить файл:\n    {"tool": "delete_user_file", "file_id": 1} или {"tool": "delete_user_file", "filename": "old.txt"}',
 }
 
 
@@ -38,6 +45,13 @@ class FloraBrain:
         self.base_url = Config.LLM_BASE_URL
         self.model = Config.LLM_MODEL
         self.browser = WebBrowserTool(self.db)
+        self.files = FileTool(self.db)
+        self._file_to_send: tuple[int, int] | None = None  # (user_id, file_id)
+
+    def pop_file_to_send(self) -> tuple[int, int] | None:
+        pending = self._file_to_send
+        self._file_to_send = None
+        return pending
 
     def _looks_like_search_request(self, text: str) -> bool:
         lower = text.lower()
@@ -113,7 +127,7 @@ class FloraBrain:
         user_facts_str = "\n".join([f"- {k}: {v}" for k, v in user_facts.items()]) if user_facts else "Пока нет сохранённых фактов."
 
         tools_str = "\n\n".join(
-            f"{i + 1}. {desc}" for i, desc in enumerate(TOOL_DESCRIPTIONS.values())
+            f"{i + 1}. {desc}" for i, desc in enumerate(filter_tool_descriptions(TOOL_DESCRIPTIONS).values())
         )
         planner_context = self._format_planner_context(user_id)
         slang_context = self._format_slang_and_style_context(user_id, chat_id=chat_id if is_group else None)
@@ -154,6 +168,16 @@ class FloraBrain:
 - «запиши идеи» / «сохрани идеи» → save_ideas (или save_day_note)
 - «найди в интернете» / «поищи» / «загугли» / «search» → web_search (реальный браузер), затем web_fetch если нужны детали
 - «посмотри сайт» / «проанализируй» / «вытащи инфу» → web_fetch (если есть URL)
+- «прочитай файл» / «что в файле» / «список файлов» / «сохрани в файл» / «удали файл» → list_user_files, read_user_file, write_user_file, delete_user_file
+
+Файлы пользователя:
+- Пользователь может прикрепить файл в чат — он сохраняется с file_id. Сначала list_user_files если не знаешь id.
+- read_user_file — читай и анализируй содержимое, давай фидбек по запросу.
+- write_user_file / save_text_as_file — создавай текстовые файлы (.txt, .md, .json и т.д.).
+- send_to_chat: true — отправь готовый файл пользователю в чат после сохранения.
+- delete_user_file — только если явно попросили удалить.
+- Работай только с файлами этого пользователя. Не выдумывай содержимое — читай через read_user_file.
+- {permissions_summary()}
 
 Поиск в браузере (КРИТИЧЕСКИ ВАЖНО):
 - Если просят найти, поискать, загуглить — СРАЗУ вызывай web_search в ЭТОМ же сообщении через JSON.
@@ -244,6 +268,9 @@ class FloraBrain:
 
         if tool_name not in TOOL_DESCRIPTIONS:
             return json.dumps({"success": False, "error": f"Неизвестный инструмент: {tool_name}"})
+
+        if not is_file_tool_allowed(tool_name):
+            return json.dumps({"success": False, "error": f"Операция с файлами «{tool_name}» не разрешена настройками."})
 
         try:
             if tool_name == "save_user_fact":
@@ -362,6 +389,34 @@ class FloraBrain:
             elif tool_name == "list_slang_words":
                 words = self.db.get_slang_words(user_id)
                 return json.dumps({"success": True, "slang": words, "count": len(words)})
+
+            elif tool_name == "list_user_files":
+                return json.dumps(self.files.list_files(user_id), ensure_ascii=False)
+
+            elif tool_name in ("read_user_file",):
+                return json.dumps(self.files.read_file(
+                    user_id,
+                    file_id=tool_call.get("file_id"),
+                    filename=tool_call.get("filename"),
+                ), ensure_ascii=False)
+
+            elif tool_name in ("write_user_file", "save_text_as_file"):
+                res = self.files.write_file(
+                    user_id,
+                    filename=tool_call.get("filename", ""),
+                    content=tool_call.get("content", ""),
+                    send_to_chat=bool(tool_call.get("send_to_chat")),
+                )
+                if res.get("success") and res.get("send_to_chat"):
+                    self._file_to_send = (user_id, res["file_id"])
+                return json.dumps(res, ensure_ascii=False)
+
+            elif tool_name == "delete_user_file":
+                return json.dumps(self.files.delete_file(
+                    user_id,
+                    file_id=tool_call.get("file_id"),
+                    filename=tool_call.get("filename"),
+                ), ensure_ascii=False)
 
             return json.dumps({"success": False, "error": f"Unknown tool: {tool_name}"})
 
