@@ -154,7 +154,8 @@ class FloraBrain:
 - Можешь смотреть сайты (web_fetch) и искать в браузере (web_search).
 - Общайся в стиле чата: используй их сленг естественно, не перебарщивай.
 - Обращайся к отправителю по имени.
-- Пользователь может ответить коротко («да», «нет», «завтра») без слова Flora — если ты задала вопрос, читай контекст последних сообщений.
+- Пользователь может ответить коротко («да», «нет», «завтра») без слова Flora — только если это ответ на ТВОЙ вопрос.
+- Не отвечай на сообщения, которые явно не к тебе: общение людей между собой, оффтоп, «привет всем».
 - Файл пользователь может прислать отдельным сообщением сразу после просьбы — учитывай это.
 """
 
@@ -525,6 +526,43 @@ class FloraBrain:
         except Exception as e:
             logger.error(f"File analysis failed: {e}")
             return "Не получилось проанализировать файл, попробуй ещё раз 🥺"
+
+    async def is_message_for_flora(self, text: str, sender_name: str, chat_id: int) -> bool:
+        """LLM check for borderline messages — is this directed at Flora?"""
+        history = self.db.get_group_chat_history(chat_id, limit=8)
+        context_lines = []
+        for msg in history[-6:]:
+            who = "Flora" if msg["role"] == "assistant" else (msg.get("sender_name") or "участник")
+            context_lines.append(f"{who}: {msg['content'][:180]}")
+        context = "\n".join(context_lines) or "(история пуста)"
+
+        instruction = """Ты классификатор. Сообщение из группового чата.
+Ответь строго одним словом: yes или no.
+
+yes — сообщение обращено к Flora (боту): просьба, ответ на её вопрос, продолжение её диалога.
+no — сообщение для других людей, оффтоп, болтовня, не требует ответа бота."""
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": instruction},
+                            {"role": "user", "content": f"Контекст:\n{context}\n\nНовое от {sender_name}: «{text[:400]}»"},
+                        ],
+                        "temperature": 0,
+                        "max_tokens": 5,
+                    },
+                )
+                response.raise_for_status()
+                raw = response.json()["choices"][0]["message"]["content"].strip().lower()
+                return raw.startswith("yes") or raw == "да"
+        except Exception as e:
+            logger.error(f"Message intent classification failed: {e}")
+            return False
 
     async def generate_response(
         self,

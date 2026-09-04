@@ -15,6 +15,7 @@ from app.brain import FloraBrain
 from app import reminder_ui as confirm_ui
 from app import file_analysis as fa
 from app.chat_context import flora_sessions, chat_queue
+from app import message_intent as mi
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,11 +111,23 @@ async def should_respond_to_message(message: Message, user_id: int) -> bool:
         me = await bot.get_me()
         if message.reply_to_message.from_user.id == me.id:
             return True
-    if flora_sessions.is_active(user_id):
-        return True
     if fa.get_file_wait(user_id):
         return True
-    return False
+
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        return False
+
+    sender_name = message.from_user.first_name or message.from_user.username or "участник"
+    history = db.get_group_chat_history(GROUP, limit=12)
+
+    ruled = mi.rule_based_is_for_flora(text, sender_name, history)
+    if ruled is True:
+        return True
+    if ruled is False:
+        return False
+
+    return await brain.is_message_for_flora(text, sender_name, GROUP)
 
 
 def _parse_event_time(event_time: str):
