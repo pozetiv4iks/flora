@@ -10,6 +10,10 @@ from app.tools.browser_tool import WebBrowserTool
 
 logger = logging.getLogger(__name__)
 
+SEARCH_KEYWORDS = ("найди", "поищи", "загугли", "search", "интернет", "браузер", "google", "домен")
+PROMISE_PHRASES = ("сейчас поищу", "один момент", "подожди", "сейчас найду", "поищу ", "ищу ", "секунду", "минутку")
+WEB_TOOLS = {"web_search", "web_fetch"}
+
 TOOL_DESCRIPTIONS = {
     "save_user_fact": 'Сохранить факт о пользователе:\n    {"tool": "save_user_fact", "key": "ключ", "value": "значение"}',
     "save_day_note": 'Сохранить заметку на день (YYYY-MM-DD):\n    {"tool": "save_day_note", "date": "2026-09-05", "content": "текст"}',
@@ -34,6 +38,21 @@ class FloraBrain:
         self.base_url = Config.LLM_BASE_URL
         self.model = Config.LLM_MODEL
         self.browser = WebBrowserTool(self.db)
+
+    def _looks_like_search_request(self, text: str) -> bool:
+        lower = text.lower()
+        return any(k in lower for k in SEARCH_KEYWORDS)
+
+    def _looks_like_empty_promise(self, text: str) -> bool:
+        lower = text.lower()
+        return any(p in lower for p in PROMISE_PHRASES)
+
+    def _should_skip_intermediate(self, clean_reply: str, tool_name: str = None) -> bool:
+        if tool_name in WEB_TOOLS:
+            return True
+        if self._looks_like_empty_promise(clean_reply):
+            return True
+        return False
 
     def _format_planner_context(self, user_id: int) -> str:
         from datetime import datetime
@@ -136,11 +155,13 @@ class FloraBrain:
 - «найди в интернете» / «поищи» / «загугли» / «search» → web_search (реальный браузер), затем web_fetch если нужны детали
 - «посмотри сайт» / «проанализируй» / «вытащи инфу» → web_fetch (если есть URL)
 
-Поиск в браузере (ВАЖНО):
-- Если просят найти, поискать, загуглить — ОБЯЗАТЕЛЬНО web_search. Не отвечай из памяти о свежих фактах.
-- После web_search: кратко перескажи топ-3 результата со ссылками.
-- Если нужны детали с конкретной страницы — web_fetch по лучшей ссылке, потом фидбек.
-- Если запрос слишком размытый — один уточняющий вопрос («что именно искать?»).
+Поиск в браузере (КРИТИЧЕСКИ ВАЖНО):
+- Если просят найти, поискать, загуглить — СРАЗУ вызывай web_search в ЭТОМ же сообщении через JSON.
+- ЗАПРЕЩЕНО писать «сейчас поищу», «один момент», «подожди», «ищу» БЕЗ JSON-блока web_search/web_fetch в том же сообщении.
+- Перед поиском не болтай — либо сразу JSON без текста, либо одно слово «Сек» + JSON.
+- После web_search ОБЯЗАТЕЛЬНО дай пользователю результат: топ ссылок и краткий ответ. Не останавливайся на обещании.
+- Если нужны детали — второй вызов web_fetch, потом полный фидбек.
+- Если запрос размытый — один короткий вопрос БЕЗ обещания поиска.
 
 Анализ сайтов (ВАЖНО):
 - Если дали URL — сначала web_fetch, потом на основе текста страницы дай фидбек.
@@ -174,9 +195,15 @@ class FloraBrain:
 План (add_plan_item) — нужны: название + plan_date. Спроси: «На какой день?» и «Во сколько напомнить?» (remind_at_time, например 09:00)
 
 Созвон/событие (add_schedule_event) — нужны: title + event_date + event_time (для созвонов).
-  Обязательно спроси: «За сколько напомнить?» → remind_minutes_before в минутах (15, 30, 60, 120).
+  Спроси «За сколько напомнить?» — пользователь выберет кнопкой (15/30/60/120 мин).
   Переводи ответы: «за час»=60, «за полчаса»=30, «за 15 минут»=15.
-  Если событие без точного времени — спроси «Во сколько напомнить?» → remind_at_time (HH:MM).
+  После успешного сохранения напиши коротко: «Готово ✅» и что именно записала.
+
+Напоминания с кнопками:
+- Если не хватает данных для напоминания — задай один вопрос формулировкой:
+  «Какое напоминание?» / «На какой день?» / «Во сколько?» / «За сколько напомнить?»
+- Пользователь ответит кнопкой — прими значение и двигайся дальше.
+- В конце всегда «Готово ✅» с кратким итогом.
 
 Только когда пользователь ответил на все вопросы — вызывай инструмент с полными данными.
 
@@ -358,7 +385,7 @@ class FloraBrain:
         else:
             self.db.add_message(user_id, "user", user_message)
 
-        max_iterations = 4
+        max_iterations = 6
 
         for iteration in range(max_iterations):
             if is_group and chat_id:
@@ -408,6 +435,36 @@ class FloraBrain:
                         tool_json_str = candidates[-1][1]
 
                     if not tool_json_str:
+                        needs_search_nudge = (
+                            self._looks_like_search_request(user_message)
+                            and self._looks_like_empty_promise(reply)
+                        )
+                        had_web_result = any(
+                            "[Результат web_search]" in m.get("content", "")
+                            or "[Результат web_fetch]" in m.get("content", "")
+                            for m in history
+                        )
+                        needs_result_nudge = had_web_result and self._looks_like_empty_promise(reply)
+
+                        if needs_search_nudge or needs_result_nudge:
+                            if needs_result_nudge:
+                                nudge = (
+                                    "[Система]: Поиск уже выполнен — результаты в истории. "
+                                    "Дай пользователю готовый ответ: ссылки, факты, вывод. "
+                                    "Без «сейчас поищу» и «один момент»."
+                                )
+                            else:
+                                nudge = (
+                                    "[Система]: Ты обещала поиск, но не вызвала инструмент. "
+                                    "Немедленно вызови web_search или web_fetch через JSON в следующем ответе. "
+                                    "Не повторяй обещания."
+                                )
+                            if is_group and chat_id:
+                                self.db.add_group_message(chat_id, "system", nudge)
+                            else:
+                                self.db.add_message(user_id, "system", nudge)
+                            continue
+
                         if is_group and chat_id:
                             self.db.add_group_message(chat_id, "assistant", reply)
                         else:
@@ -429,7 +486,8 @@ class FloraBrain:
                             return reply
 
                     clean_reply = reply.replace(tool_json_str, "").strip()
-                    if clean_reply:
+                    tool_name = tool_call.get("tool", "")
+                    if clean_reply and not self._should_skip_intermediate(clean_reply, tool_name):
                         if is_group and chat_id:
                             self.db.add_group_message(chat_id, "assistant", clean_reply)
                         else:
@@ -452,7 +510,9 @@ class FloraBrain:
                         final_messages = [{
                             "role": "system",
                             "content": self._get_system_prompt(user_id, is_group=is_group, chat_title=chat_title, chat_id=chat_id)
-                            + "\nИнструменты отключены. Дай пользователю понятный ответ: если был web_fetch — полный фидбек по его запросу на основе текста страницы."
+                            + "\nИнструменты отключены. Дай полный ответ пользователю по его запросу. "
+                            "Если был web_search или web_fetch — обязательно перечисли результаты и вывод. "
+                            "Не пиши «ищу» или «момент» — только готовый результат."
                         }]
                         for msg in final_history:
                             final_messages.append({"role": msg["role"], "content": msg["content"]})
