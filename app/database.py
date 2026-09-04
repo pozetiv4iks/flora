@@ -16,43 +16,11 @@ class Database:
         return conn
 
     def _init_db(self):
-        """Initialize the database tables with multi-tenant subscription support."""
+        """Initialize the database tables."""
         default_uid = Config.ALLOWED_USER_IDS[0] if Config.ALLOWED_USER_IDS else 0
         
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            
-            # Table for users subscription plans
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    telegram_id INTEGER PRIMARY KEY,
-                    plan TEXT DEFAULT 'none', -- 'none', 'starter', 'pro', 'business', 'owner'
-                    status TEXT DEFAULT 'active', -- 'active', 'inactive'
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Table for daily API and message limits tracking
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS usage_daily (
-                    user_id INTEGER,
-                    date TEXT,
-                    messages INTEGER DEFAULT 0,
-                    tokens INTEGER DEFAULT 0,
-                    emails INTEGER DEFAULT 0,
-                    calendar_actions INTEGER DEFAULT 0,
-                    chat_actions INTEGER DEFAULT 0,
-                    PRIMARY KEY (user_id, date)
-                )
-            """)
-            
-            # Auto-insert owner IDs from Config
-            if Config.ALLOWED_USER_IDS:
-                for oid in Config.ALLOWED_USER_IDS:
-                    cursor.execute(
-                        "INSERT OR IGNORE INTO users (telegram_id, plan, status) VALUES (?, 'owner', 'active')",
-                        (oid,)
-                    )
             
             # Table for telegram chat history
             cursor.execute("""
@@ -164,6 +132,63 @@ class Database:
                     PRIMARY KEY (user_id, domain)
                 )
             """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS day_notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    note_date TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS plan_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    plan_date TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    completed_at DATETIME
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS schedule_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    event_date TEXT NOT NULL,
+                    event_time TEXT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    reminded INTEGER DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS group_chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    owner_user_id INTEGER NOT NULL,
+                    chat_title TEXT,
+                    registered_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS group_chat_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    sender_name TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             
             conn.commit()
 
@@ -192,63 +217,6 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM chat_history WHERE user_id = ?", (user_id,))
-            conn.commit()
-
-    # --- Multi-tenant Subscriptions & Plans ---
-    def get_user_plan(self, user_id: int) -> dict:
-        """Fetch subscription plan and status of a user. Allowed owners automatically bypass checks."""
-        if Config.ALLOWED_USER_IDS and user_id in Config.ALLOWED_USER_IDS:
-            return {"plan": "owner", "status": "active"}
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT plan, status FROM users WHERE telegram_id = ?", (user_id,))
-            row = cursor.fetchone()
-            if row:
-                return {"plan": row["plan"], "status": row["status"]}
-            return {"plan": "none", "status": "inactive"}
-
-    def set_user_plan(self, user_id: int, plan: str, status: str = 'active'):
-        """Directly insert/update user plan (used by administrators/owners)."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT OR REPLACE INTO users (telegram_id, plan, status) VALUES (?, ?, ?)",
-                (user_id, plan, status)
-            )
-            conn.commit()
-
-    def get_daily_usage(self, user_id: int) -> dict:
-        """Retrieve daily usage counts for a user on today's date."""
-        today = datetime.now().strftime("%Y-%m-%d")
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT messages, tokens, emails, calendar_actions, chat_actions FROM usage_daily WHERE user_id = ? AND date = ?",
-                (user_id, today)
-            )
-            row = cursor.fetchone()
-            if row:
-                return dict(row)
-            return {"messages": 0, "tokens": 0, "emails": 0, "calendar_actions": 0, "chat_actions": 0}
-
-    def increment_usage(self, user_id: int, counter_name: str, increment: int = 1):
-        """Safely increment a usage counter (e.g. messages, tokens) for today."""
-        today = datetime.now().strftime("%Y-%m-%d")
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            # Insert with default values if not exists
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO usage_daily (user_id, date)
-                VALUES (?, ?)
-                """,
-                (user_id, today)
-            )
-            # Update the counter
-            cursor.execute(
-                f"UPDATE usage_daily SET {counter_name} = {counter_name} + ? WHERE user_id = ? AND date = ?",
-                (increment, user_id, today)
-            )
             conn.commit()
 
     # --- User Facts Methods ---
@@ -376,3 +344,204 @@ class Database:
                 (user_id, domain.lower().strip())
             )
             conn.commit()
+
+    # --- Day Notes ---
+    def add_day_note(self, user_id: int, note_date: str, content: str) -> int:
+        now = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO day_notes (user_id, note_date, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, note_date, content, now, now)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_day_notes(self, user_id: int, note_date: str = None, limit: int = 20) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if note_date:
+                cursor.execute(
+                    "SELECT id, note_date, content, created_at FROM day_notes WHERE user_id = ? AND note_date = ? ORDER BY id DESC",
+                    (user_id, note_date)
+                )
+            else:
+                cursor.execute(
+                    "SELECT id, note_date, content, created_at FROM day_notes WHERE user_id = ? ORDER BY note_date DESC, id DESC LIMIT ?",
+                    (user_id, limit)
+                )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def delete_day_note(self, user_id: int, note_id: int) -> bool:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM day_notes WHERE id = ? AND user_id = ?", (note_id, user_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # --- Plan Items ---
+    def add_plan_item(self, user_id: int, title: str, description: str = None, plan_date: str = None) -> int:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO plan_items (user_id, title, description, plan_date, status) VALUES (?, ?, ?, ?, 'pending')",
+                (user_id, title, description, plan_date)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def list_plan_items(self, user_id: int, status: str = None, plan_date: str = None, limit: int = 30) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT id, title, description, plan_date, status, created_at, completed_at FROM plan_items WHERE user_id = ?"
+            params = [user_id]
+            if status:
+                query += " AND status = ?"
+                params.append(status)
+            if plan_date:
+                query += " AND plan_date = ?"
+                params.append(plan_date)
+            query += " ORDER BY CASE WHEN plan_date IS NULL THEN 1 ELSE 0 END, plan_date ASC, id ASC LIMIT ?"
+            params.append(limit)
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def complete_plan_item(self, user_id: int, item_id: int = None, title: str = None) -> dict:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if item_id:
+                cursor.execute(
+                    "SELECT id, title FROM plan_items WHERE id = ? AND user_id = ? AND status = 'pending'",
+                    (item_id, user_id)
+                )
+            elif title:
+                cursor.execute(
+                    "SELECT id, title FROM plan_items WHERE user_id = ? AND status = 'pending' AND title LIKE ? ORDER BY id DESC LIMIT 1",
+                    (user_id, f"%{title}%")
+                )
+            else:
+                return {"success": False, "error": "Укажи id или название пункта плана"}
+            row = cursor.fetchone()
+            if not row:
+                return {"success": False, "error": "Пункт плана не найден или уже выполнен"}
+            now = datetime.now().isoformat()
+            cursor.execute(
+                "UPDATE plan_items SET status = 'completed', completed_at = ? WHERE id = ?",
+                (now, row["id"])
+            )
+            conn.commit()
+            return {"success": True, "id": row["id"], "title": row["title"]}
+
+    def delete_plan_item(self, user_id: int, item_id: int) -> bool:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM plan_items WHERE id = ? AND user_id = ?", (item_id, user_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # --- Schedule Events ---
+    def add_schedule_event(self, user_id: int, event_date: str, title: str, event_time: str = None, description: str = None) -> int:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO schedule_events (user_id, event_date, event_time, title, description) VALUES (?, ?, ?, ?, ?)",
+                (user_id, event_date, event_time, title, description)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_schedule(self, user_id: int, event_date: str = None, days_ahead: int = 7) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if event_date:
+                cursor.execute(
+                    "SELECT id, event_date, event_time, title, description FROM schedule_events WHERE user_id = ? AND event_date = ? ORDER BY event_time ASC, id ASC",
+                    (user_id, event_date)
+                )
+            else:
+                from datetime import timedelta
+                today = datetime.now().strftime("%Y-%m-%d")
+                end = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+                cursor.execute(
+                    "SELECT id, event_date, event_time, title, description FROM schedule_events WHERE user_id = ? AND event_date >= ? AND event_date <= ? ORDER BY event_date ASC, event_time ASC",
+                    (user_id, today, end)
+                )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_upcoming_unreminded_events(self, user_id: int, within_hours: int = 24) -> list:
+        from datetime import timedelta
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT id, user_id, event_date, event_time, title, description FROM schedule_events
+                   WHERE user_id = ? AND reminded = 0 AND event_date IN (?, ?)
+                   ORDER BY event_date ASC, event_time ASC""",
+                (user_id, today, tomorrow)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_all_upcoming_unreminded_events(self) -> list:
+        from datetime import timedelta
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT id, user_id, event_date, event_time, title, description FROM schedule_events
+                   WHERE reminded = 0 AND event_date IN (?, ?)
+                   ORDER BY user_id, event_date ASC, event_time ASC""",
+                (today, tomorrow)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def mark_event_reminded(self, event_id: int):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE schedule_events SET reminded = 1 WHERE id = ?", (event_id,))
+            conn.commit()
+
+    # --- Group Chats ---
+    def register_group_chat(self, chat_id: int, owner_user_id: int, chat_title: str = None):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO group_chats (chat_id, owner_user_id, chat_title, registered_at) VALUES (?, ?, ?, ?)",
+                (chat_id, owner_user_id, chat_title, datetime.now().isoformat())
+            )
+            conn.commit()
+
+    def get_group_chat_owner(self, chat_id: int) -> int:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT owner_user_id FROM group_chats WHERE chat_id = ?", (chat_id,))
+            row = cursor.fetchone()
+            return row["owner_user_id"] if row else None
+
+    def get_registered_group_chats(self, owner_user_id: int) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT chat_id, chat_title FROM group_chats WHERE owner_user_id = ?", (owner_user_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def add_group_message(self, chat_id: int, role: str, content: str, sender_name: str = None):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO group_chat_history (chat_id, role, content, sender_name) VALUES (?, ?, ?, ?)",
+                (chat_id, role, content, sender_name)
+            )
+            conn.commit()
+
+    def get_group_chat_history(self, chat_id: int, limit: int = 20) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT role, content, sender_name, timestamp FROM group_chat_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+                (chat_id, limit)
+            )
+            rows = cursor.fetchall()
+            return [{"role": r["role"], "content": r["content"], "sender_name": r["sender_name"], "timestamp": r["timestamp"]} for r in reversed(rows)]

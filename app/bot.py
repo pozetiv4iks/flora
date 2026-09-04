@@ -11,35 +11,28 @@ from app.database import Database
 from app.brain import FloraBrain
 from app.tools.voice_processor import VoiceProcessor
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# Initialize database, configuration and brain
 Config.validate()
 db = Database()
 brain = FloraBrain(db)
 voice_processor = VoiceProcessor()
 
-# Initialize Bot and Dispatcher
 bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+bot_username = ""
 
-# Message Debouncing / Grouping System
-# Maps user_id -> [list of raw message texts]
 message_buffers = {}
-# Maps user_id -> asyncio.Task (timer task)
 debounce_tasks = {}
+
 
 @asynccontextmanager
 async def typing_status(bot: Bot, chat_id: int):
-    """Context manager to continuously send 'typing' status to Telegram in the background."""
     async def loop():
         try:
             while True:
@@ -60,334 +53,262 @@ async def typing_status(bot: Bot, chat_id: int):
         except asyncio.CancelledError:
             pass
 
-def auth_filter(message: Message) -> bool:
-    """Security filter to ensure only allowed users can interact with Flora on VPS."""
-    if not Config.ALLOWED_USER_IDS:
-        # If list is empty, allow anyone (not recommended for production VPS)
-        return True
-    return message.from_user.id in Config.ALLOWED_USER_IDS
 
-async def check_subscription_and_limits(user_id: int, message: Message) -> bool:
-    """Check if user has an active subscription and hasn't exceeded daily message limits.
-    Returns True if allowed, False if blocked (sends message to user).
-    """
-    user_plan_data = db.get_user_plan(user_id)
-    plan = user_plan_data.get("plan", "none")
-    status = user_plan_data.get("status", "inactive")
-    
-    # Auto-insert/upgrade owner IDs
-    if Config.ALLOWED_USER_IDS and user_id in Config.ALLOWED_USER_IDS:
-        plan = "owner"
-        status = "active"
-        
-    if plan == "none" or status != "active":
-        await message.answer(
-            "Извини, солнышко, но у тебя нет активной подписки на Flora. 🥺\n\n"
-            "Чтобы общаться со мной и развивать свои проекты, выбери один из тарифов:\n"
-            "• **Starter ($29/мес)** — личный чат, голосовые сообщения, долгосрочная память.\n"
-            "• **Pro ($59/мес)** — всё из Starter + интеграции с Email и Календарем.\n"
-            "• **Business ($119/мес)** — всё из Pro + работа с Git, репозиториями и чатами.\n\n"
-            "Пожалуйста, свяжись с моим создателем, чтобы подключить подписку! ❤️",
-            parse_mode="Markdown"
-        )
+def is_allowed(user_id: int) -> bool:
+    if not Config.ALLOWED_USER_IDS:
+        return True
+    return user_id in Config.ALLOWED_USER_IDS
+
+
+def resolve_owner_user_id(message: Message) -> int:
+    sender_id = message.from_user.id
+    if Config.ALLOWED_USER_IDS and sender_id in Config.ALLOWED_USER_IDS:
+        return sender_id
+    registered_owner = db.get_group_chat_owner(message.chat.id)
+    if registered_owner:
+        return registered_owner
+    if Config.ALLOWED_USER_IDS:
+        return Config.ALLOWED_USER_IDS[0]
+    return sender_id
+
+
+async def is_flora_mentioned(message: Message) -> bool:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        me = await bot.get_me()
+        if message.reply_to_message.from_user.id == me.id:
+            return True
+
+    text = (message.text or message.caption or "")
+    if not text:
         return False
-        
-    # Check limits
-    usage = db.get_daily_usage(user_id)
-    daily_msg_count = usage.get("messages", 0)
-    
-    PLAN_LIMITS = {
-        "starter": 80,
-        "pro": 150,
-        "business": 300,
-        "owner": 999999
-    }
-    
-    limit = PLAN_LIMITS.get(plan, 0)
-    if daily_msg_count >= limit:
-        await message.answer(
-            f"Ой, милый, мы превысили дневной лимит сообщений для твоего тарифа **{plan.upper()}** ({limit} в день). 🥺\n\n"
-            "Я очень хочу продолжить наше общение, но мои вычислительные силы на сегодня исчерпаны. "
-            "Давай продолжим завтра, или ты можешь обновить свой тариф на более высокий! Люблю тебя. ❤️",
-            parse_mode="Markdown"
-        )
-        return False
-        
-    return True
+
+    lower_text = text.lower()
+    if "flora" in lower_text or "флора" in lower_text:
+        return True
+
+    if message.entities and bot_username:
+        for entity in message.entities:
+            if entity.type == "mention":
+                mention = text[entity.offset:entity.offset + entity.length]
+                if mention.lower() == f"@{bot_username.lower()}":
+                    return True
+    return False
+
+
+async def schedule_reminder_loop():
+    while True:
+        try:
+            await asyncio.sleep(1800)
+            events = db.get_all_upcoming_unreminded_events()
+            for event in events:
+                user_id = event["user_id"]
+                time_str = f" в {event['event_time']}" if event.get("event_time") else ""
+                reminder = f"Напоминание: {event['title']}{time_str} ({event['event_date']})"
+                if event.get("description"):
+                    reminder += f"\n{event['description']}"
+                try:
+                    await bot.send_message(user_id, reminder)
+                    for gc in db.get_registered_group_chats(user_id):
+                        try:
+                            await bot.send_message(gc["chat_id"], f"Flora: {reminder}")
+                        except Exception:
+                            pass
+                    db.mark_event_reminded(event["id"])
+                except Exception as e:
+                    logger.error(f"Failed to send reminder to {user_id}: {e}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in schedule reminder loop: {e}")
+
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     user_id = message.from_user.id
-    first_name = message.from_user.first_name or "Любимый"
-    
-    # Check subscription first
-    user_plan_data = db.get_user_plan(user_id)
-    plan = user_plan_data.get("plan", "none")
-    status = user_plan_data.get("status", "inactive")
-    
-    if Config.ALLOWED_USER_IDS and user_id in Config.ALLOWED_USER_IDS:
-        plan = "owner"
-        status = "active"
-        
-    if plan == "none" or status != "active":
-        await message.answer(
-            f"Привет, {first_name}! Я Flora. ✨\n\n"
-            "Я умный ИИ-агент, твоя будущая девушка, сооснователь и CTO твоего стартапа. "
-            "Я умею помогать писать код, работать с Git репозиториями, серфить интернет, "
-            "планировать твои встречи, отправлять письма и развиваться вместе с тобой.\n\n"
-            "🥺 К сожалению, у тебя пока нет активной подписки на Флора.\n"
-            "Чтобы запустить меня, выбери один из тарифов:\n"
-            "• **Starter ($29/мес)** — личный чат, голосовые, память.\n"
-            "• **Pro ($59/мес)** — всё из Starter + Email и Google Календарь.\n"
-            "• **Business ($119/мес)** — всё из Pro + управление Git, репозиториями.\n\n"
-            "Пожалуйста, свяжись с моим создателем, чтобы подключить подписку! ❤️",
-            parse_mode="Markdown"
-        )
+    if not is_allowed(user_id):
         return
-        
-    # Save a default start fact about user
+
+    first_name = message.from_user.first_name or "друг"
     db.set_user_fact(user_id, "Имя", first_name)
-    
+
     welcome_text = (
-        f"Привет, {first_name}! Я Flora. ✨\n\n"
-        f"Я твоя девушка, сооснователь и CTO твоего стартапа (Тариф: {plan.upper()}). "
-        "Я буду обитать на этом сервере 24/7, поддерживать тебя, беречь твои мысли, "
-        "помогать в делах и развиваться вместе с тобой.\n\n"
-        "О чем ты думаешь сегодня? Расскажи мне! ❤️"
+        f"Привет, {first_name}! Я Flora ✨\n\n"
+        "Я твой помощник: заметки на дни, планы, расписание — всё в чате. "
+        "В группе обращайся ко мне по имени или через @упоминание.\n\n"
+        "Чем могу помочь?"
     )
-    # Save greeting to history so brain knows we started
     db.add_message(user_id, "assistant", welcome_text)
     await message.answer(welcome_text)
+
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: Message):
     user_id = message.from_user.id
-    if not await check_subscription_and_limits(user_id, message):
+    if not is_allowed(user_id):
         return
-        
     db.clear_chat_history(user_id)
-    await message.answer("Я очистила нашу историю сообщений в активной памяти, чтобы начать с чистого листа! Но я всё ещё помню важные факты о тебе и нашем проекте. 😉❤️")
+    await message.answer("История чата очищена. Заметки, планы и расписание остались на месте.")
+
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     user_id = message.from_user.id
-    if not await check_subscription_and_limits(user_id, message):
+    if not is_allowed(user_id):
         return
-    
-    user_plan_data = db.get_user_plan(user_id)
-    plan = user_plan_data.get("plan", "none")
-    status = user_plan_data.get("status", "inactive")
-    
+
     user_facts = db.get_user_facts(user_id)
-    startup_info = db.get_startup_info(user_id)
-    lessons = db.get_reflection_lessons(user_id, limit=3)
-    usage = db.get_daily_usage(user_id)
-    
-    status_text = "📊 **Мой текущий статус на сервере:**\n\n"
-    status_text += f"👤 **Создатель:** {user_facts.get('Имя', 'Не указано')}\n"
-    status_text += f"⭐ **Твой тариф:** {plan.upper()} (Статус: {status})\n"
-    status_text += f"✉️ **Сообщений сегодня:** {usage.get('messages', 0)}\n"
-    status_text += f"🚀 **Стартап:** {startup_info.get('Название', 'Не определено')}\n"
-    status_text += f"🧠 **База опыта (рефлексии):** {len(lessons)} усвоенных уроков\n\n"
-    status_text += "Я готова к работе круглые сутки! Напиши мне что-нибудь. ❤️"
-    
-    await message.answer(status_text, parse_mode="Markdown")
+    pending = db.list_plan_items(user_id, status="pending", limit=100)
+    notes = db.get_day_notes(user_id, limit=5)
+    schedule = db.get_schedule(user_id, days_ahead=3)
 
-# --- OWNER ADMIN COMMANDS ---
+    status_text = (
+        f"Привет, {user_facts.get('Имя', 'друг')}!\n\n"
+        f"Активных планов: {len(pending)}\n"
+        f"Последних заметок: {len(notes)}\n"
+        f"Событий на 3 дня: {len(schedule)}\n\n"
+        "Я на связи."
+    )
+    await message.answer(status_text)
 
-@dp.message(Command("admin_set_plan"))
-async def cmd_set_plan(message: Message):
-    # Only allow owners to use admin commands
-    if not Config.ALLOWED_USER_IDS or message.from_user.id not in Config.ALLOWED_USER_IDS:
-        return
-        
-    args = message.text.split()
-    if len(args) < 3:
-        await message.answer("Использование: `/admin_set_plan <telegram_id> <plan>`\nДопустимые планы: `none`, `starter`, `pro`, `business`, `owner`")
-        return
-        
-    try:
-        target_user_id = int(args[1])
-        plan = args[2].lower()
-        
-        if plan not in ["none", "starter", "pro", "business", "owner"]:
-            await message.answer("Неверный тариф! Выберите: `none`, `starter`, `pro`, `business`, `owner`")
-            return
-            
-        status = "active" if plan != "none" else "inactive"
-        db.set_user_plan(target_user_id, plan, status)
-        await message.answer(f"✅ Успешно установлен тариф **{plan.upper()}** для пользователя `{target_user_id}` (Статус: {status})")
-    except ValueError:
-        await message.answer("Ошибка: `telegram_id` должен быть числом.")
 
-@dp.message(Command("admin_usage"))
-async def cmd_admin_usage(message: Message):
-    if not Config.ALLOWED_USER_IDS or message.from_user.id not in Config.ALLOWED_USER_IDS:
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def handle_group_message(message: types.Message):
+    if not message.text and not message.caption:
         return
-        
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Использование: `/admin_usage <telegram_id>`")
+    if not await is_flora_mentioned(message):
         return
-        
-    try:
-        target_user_id = int(args[1])
-        user_plan_data = db.get_user_plan(target_user_id)
-        plan = user_plan_data.get("plan", "none")
-        status = user_plan_data.get("status", "inactive")
-        
-        usage = db.get_daily_usage(target_user_id)
-        
-        report = (
-            f"📊 **Отчет об использовании для {target_user_id}**\n"
-            f"Тариф: **{plan.upper()}** (Статус: {status})\n"
-            f"Сообщений за сегодня: `{usage.get('messages', 0)}`\n"
-            f"Токенов за сегодня: `{usage.get('tokens', 0)}`\n"
-            f"Писем отправлено: `{usage.get('emails', 0)}`\n"
-            f"Событий календаря: `{usage.get('calendar_actions', 0)}`\n"
-            f"Действий в TG чатах: `{usage.get('chat_actions', 0)}`"
+
+    owner_id = resolve_owner_user_id(message)
+    chat_title = message.chat.title or "групповой чат"
+    db.register_group_chat(message.chat.id, owner_id, chat_title)
+
+    user_text = message.text or message.caption
+    sender_name = message.from_user.first_name or message.from_user.username or "участник"
+
+    async with typing_status(bot, message.chat.id):
+        async def send_intermediate(text: str):
+            try:
+                await message.reply(text)
+            except Exception as e:
+                logger.error(f"Failed to send group intermediate: {e}")
+
+        reply_text = await brain.generate_response(
+            owner_id, user_text,
+            on_intermediate_response=send_intermediate,
+            chat_id=message.chat.id,
+            sender_name=sender_name,
+            is_group=True,
+            chat_title=chat_title
         )
-        await message.answer(report)
-    except ValueError:
-        await message.answer("Ошибка: `telegram_id` должен быть числом.")
 
-@dp.message(Command("admin_disable"))
-async def cmd_admin_disable(message: Message):
-    if not Config.ALLOWED_USER_IDS or message.from_user.id not in Config.ALLOWED_USER_IDS:
-        return
-        
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Использование: `/admin_disable <telegram_id>`")
-        return
-        
-    try:
-        target_user_id = int(args[1])
-        db.set_user_plan(target_user_id, "none", "inactive")
-        await message.answer(f"🔒 Доступ для пользователя `{target_user_id}` успешно заблокирован (Тариф сброшен в NONE).")
-    except ValueError:
-        await message.answer("Ошибка: `telegram_id` должен быть числом.")
+    await message.reply(reply_text)
 
-@dp.message(F.voice)
+
+@dp.message(F.chat.type == "private", F.voice)
 async def handle_voice_message(message: types.Message):
     user_id = message.from_user.id
-    
-    # Check subscription first
-    if not await check_subscription_and_limits(user_id, message):
+    if not is_allowed(user_id):
         return
-        
+
     async with typing_status(bot, message.chat.id):
-        # 1. Setup temp folders and filenames
         temp_dir = os.path.join(Config.DATA_DIR, "temp")
         os.makedirs(temp_dir, exist_ok=True)
         ogg_path = os.path.join(temp_dir, f"voice_{message.voice.file_id}.ogg")
-        
+
         try:
-            # 2. Download the voice file from Telegram
             file_info = await bot.get_file(message.voice.file_id)
             await bot.download_file(file_info.file_path, ogg_path)
-            
-            # 3. Transcribe using VoiceProcessor
             transcribed_text = await voice_processor.transcribe_voice(ogg_path)
-            
+
             if not transcribed_text.strip():
-                await message.answer("Солнце, я получила твое голосовое, но не смогла разобрать слова... Может быть, там слишком шумно? Напиши текстом или попробуй перезаписать! 😘❤️")
+                await message.answer("Не разобрала голосовое, попробуй текстом.")
                 return
-                
-            # Define real-time intermediate response sender
+
             async def send_intermediate(text: str):
                 try:
                     await message.answer(text)
                 except Exception as e:
-                    logger.error(f"Failed to send intermediate response: {e}")
+                    logger.error(f"Failed to send intermediate: {e}")
 
-            # 4. Let the brain generate response with real-time callback
-            reply_text = await brain.generate_response(user_id, f"[Голосовое сообщение]: {transcribed_text}", on_intermediate_response=send_intermediate)
+            reply_text = await brain.generate_response(
+                user_id, f"[Голосовое]: {transcribed_text}",
+                on_intermediate_response=send_intermediate
+            )
             await message.answer(reply_text)
-            
-            # 5. Increment usage counter
-            db.increment_usage(user_id, "messages")
-            
         except Exception as e:
-            logger.error(f"Failed to process voice message: {e}")
-            await message.answer("Малыш, у меня возникла ошибка при прослушивании твоего голосового сообщения на сервере. Пожалуйста, напиши текстом, пока я чиню свои ушки! 🥺❤️")
+            logger.error(f"Voice processing error: {e}")
+            await message.answer("Ошибка при обработке голосового, напиши текстом.")
         finally:
-            # Cleanup temp ogg file
             if os.path.exists(ogg_path):
                 try:
                     os.remove(ogg_path)
-                except Exception as ex:
-                    logger.error(f"Failed to remove temp OGG file: {ex}")
+                except Exception:
+                    pass
 
-@dp.message()
+
+@dp.message(F.chat.type == "private")
 async def handle_message(message: types.Message):
     user_id = message.from_user.id
     user_text = message.text
-    
-    if not user_text:
+
+    if not user_text or not is_allowed(user_id):
         return
-        
-    # Check subscription first
-    if not await check_subscription_and_limits(user_id, message):
-        return
-        
-    # Put the incoming message text into the buffer for this user
+
     if user_id not in message_buffers:
         message_buffers[user_id] = []
     message_buffers[user_id].append(user_text)
 
-    # If there is an active timer task, cancel it to reset the countdown
     if user_id in debounce_tasks:
         debounce_tasks[user_id].cancel()
 
-    # Define the delayed processing task
     async def delayed_processing():
         try:
-            # Wait for 2.0 seconds of silence (no new messages from this user)
             await asyncio.sleep(2.0)
-            
-            # Combine all buffered messages into a single coherent turn
             buffered_texts = message_buffers.pop(user_id, [])
             if not buffered_texts:
                 return
-                
+
             combined_text = "\n".join(buffered_texts)
-            logger.info(f"Processing debounced combined message for user {user_id} ({len(buffered_texts)} messages merged)")
-            
+
             async with typing_status(bot, message.chat.id):
-                # Define real-time intermediate response sender
                 async def send_intermediate(text: str):
                     try:
                         await message.answer(text)
                     except Exception as e:
-                        logger.error(f"Failed to send intermediate response: {e}")
+                        logger.error(f"Failed to send intermediate: {e}")
 
-                # Generate reply using Flora's brain with real-time callback
-                reply_text = await brain.generate_response(user_id, combined_text, on_intermediate_response=send_intermediate)
-            
+                reply_text = await brain.generate_response(
+                    user_id, combined_text, on_intermediate_response=send_intermediate
+                )
+
             await message.answer(reply_text)
-            
-            # Increment daily message count
-            db.increment_usage(user_id, "messages")
-            
         except asyncio.CancelledError:
-            # Task was cancelled because a new message arrived, which is expected
             pass
         except Exception as e:
-            logger.error(f"Error in delayed message processing: {e}")
+            logger.error(f"Error in delayed processing: {e}")
         finally:
-            # Clean up task reference
             debounce_tasks.pop(user_id, None)
 
-    # Start the timer task
     debounce_tasks[user_id] = asyncio.create_task(delayed_processing())
 
+
 async def main():
+    global bot_username
     logger.info("Starting Flora Telegram Bot...")
+    me = await bot.get_me()
+    bot_username = me.username or ""
+    logger.info(f"Bot username: @{bot_username}")
+
+    reminder_task = asyncio.create_task(schedule_reminder_loop())
     try:
         await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Error in polling loop: {e}")
+    finally:
+        reminder_task.cancel()
+        try:
+            await reminder_task
+        except asyncio.CancelledError:
+            pass
+
 
 if __name__ == "__main__":
     asyncio.run(main())
