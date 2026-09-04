@@ -16,6 +16,7 @@ from app import reminder_ui as confirm_ui
 from app import file_analysis as fa
 from app.chat_context import flora_sessions, chat_queue
 from app import message_intent as mi
+from app import reminders
 
 logging.basicConfig(
     level=logging.INFO,
@@ -130,66 +131,6 @@ async def should_respond_to_message(message: Message, user_id: int) -> bool:
     return await brain.is_message_for_flora(text, sender_name, GROUP)
 
 
-def _parse_event_time(event_time: str):
-    if not event_time:
-        return None
-    try:
-        parts = event_time.strip().split(":")
-        hour = int(parts[0])
-        minute = int(parts[1]) if len(parts) > 1 else 0
-        return hour, minute
-    except (ValueError, IndexError):
-        return None
-
-
-def _is_in_remind_window(now: datetime, target_h: int, target_m: int, grace_minutes: int = 10) -> bool:
-    target = now.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
-    return target <= now <= target + timedelta(minutes=grace_minutes)
-
-
-def should_remind_plan(plan: dict) -> bool:
-    now = datetime.now()
-    if plan.get("plan_date") != now.strftime("%Y-%m-%d"):
-        return False
-    parsed = _parse_event_time(plan.get("remind_at_time") or "09:00")
-    if not parsed:
-        return now.hour >= 9 and now.hour < 10
-    return _is_in_remind_window(now, parsed[0], parsed[1])
-
-
-def should_remind_schedule_event(event: dict) -> bool:
-    now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
-    tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-    event_date = event.get("event_date")
-
-    if event_date not in (today, tomorrow):
-        return False
-
-    parsed_event = _parse_event_time(event.get("event_time"))
-    if parsed_event and event_date == today:
-        hour, minute = parsed_event
-        event_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        minutes_before = event.get("remind_minutes_before") or 30
-        window_start = event_dt - timedelta(minutes=minutes_before)
-        window_end = event_dt + timedelta(minutes=10)
-        return window_start <= now <= window_end
-
-    if event_date == tomorrow and not event.get("event_time"):
-        remind_at = _parse_event_time(event.get("remind_at_time") or "20:00")
-        if remind_at:
-            return _is_in_remind_window(now, remind_at[0], remind_at[1])
-        return now.hour >= 20 and now.hour < 21
-
-    if event_date == today:
-        remind_at = _parse_event_time(event.get("remind_at_time") or "09:00")
-        if remind_at:
-            return _is_in_remind_window(now, remind_at[0], remind_at[1])
-        return now.hour >= 9 and now.hour < 10
-
-    return False
-
-
 async def send_reminder(text: str):
     try:
         await bot.send_message(GROUP, text)
@@ -200,9 +141,9 @@ async def send_reminder(text: str):
 async def reminder_loop():
     while True:
         try:
-            await asyncio.sleep(300)
+            now = reminders.now_local()
             for plan in db.get_plans_to_remind():
-                if not should_remind_plan(plan):
+                if not reminders.should_remind_plan(plan, now):
                     continue
                 text = f"📋 Напоминание по плану: {plan['title']}"
                 if plan.get("description"):
@@ -211,7 +152,7 @@ async def reminder_loop():
                 db.mark_plan_reminded(plan["id"])
 
             for event in db.get_all_unreminded_events():
-                if not should_remind_schedule_event(event):
+                if not reminders.should_remind_schedule_event(event, now):
                     continue
                 time_str = f" в {event['event_time']}" if event.get("event_time") else ""
                 label = "созвон" if any(w in event["title"].lower() for w in ("созвон", "call", "zoom", "meet")) else "событие"
@@ -224,6 +165,7 @@ async def reminder_loop():
             break
         except Exception as e:
             logger.error(f"Error in reminder loop: {e}")
+        await asyncio.sleep(Config.REMINDER_CHECK_INTERVAL_SEC)
 
 
 async def process_file_analysis(owner_id: int, file_id: int, request_text: str, sender_name: str, chat_title: str, user_id: int):
@@ -236,7 +178,7 @@ async def process_file_analysis(owner_id: int, file_id: int, request_text: str, 
     await flora_send(reply_text, log_history=False)
 
 
-async def process_flora_reply(owner_id: int, user_text: str, sender_name: str, chat_title: str, user_id: int):
+async def process_flora_reply(owner_id: int, user_text: str, sender_name: str, chat_title: str, user_id: int, banter_mode: bool = False):
     """Generate Flora response and attach confirm buttons when needed."""
     async with typing_status(bot, GROUP):
         async def send_intermediate(t: str):
@@ -249,8 +191,13 @@ async def process_flora_reply(owner_id: int, user_text: str, sender_name: str, c
             sender_name=sender_name,
             is_group=True,
             chat_title=chat_title,
+            banter_mode=banter_mode,
         )
 
+    if not reply_text or reply_text.strip() in ("", "_skip_"):
+        return
+
+    reply_text = FloraBrain.humanize_reply(reply_text)
     flora_sessions.touch(user_id, owner_id, sender_name)
 
     pending_save = brain.pop_pending_save()
@@ -532,7 +479,61 @@ async def handle_group_message(message: types.Message):
             fa.set_recent_file(user_id, owner_id, saved)
         return
 
+    if not await should_respond_to_message(message, user_id):
+        if text.strip() and mi.should_maybe_banter(text):
+            chat_queue.enqueue(_handle_banter_message(message))
+        return
+
     chat_queue.enqueue(_handle_user_message(message))
+
+
+async def _handle_banter_message(message: Message):
+    text = message.text or message.caption or ""
+    owner_id = resolve_owner_user_id(message)
+    sender_name = message.from_user.first_name or message.from_user.username or "участник"
+    chat_title = message.chat.title or "группа"
+    user_id = message.from_user.id
+    user_text = f"[реакция на реплику {sender_name}]: {text}"
+    await process_flora_reply(owner_id, user_text, sender_name, chat_title, user_id, banter_mode=True)
+
+
+_digest_sent_for_date: str | None = None
+
+
+async def idle_digest_loop():
+    global _digest_sent_for_date
+    from app.reminders import local_today, now_local
+    while True:
+        try:
+            await asyncio.sleep(Config.IDLE_DIGEST_CHECK_SEC)
+            today = local_today()
+            if _digest_sent_for_date == today:
+                continue
+            last_ts = db.get_last_group_log_timestamp(GROUP)
+            if not last_ts:
+                continue
+            try:
+                last_dt = datetime.fromisoformat(last_ts.replace("Z", ""))
+            except ValueError:
+                continue
+            now = now_local()
+            idle_hours = (now - last_dt).total_seconds() / 3600
+            if idle_hours < Config.CHAT_IDLE_HOURS:
+                continue
+            hour = now.hour
+            if hour < 18 or hour > 23:
+                continue
+            owner_id = db.get_group_chat_owner(GROUP) or (Config.ALLOWED_USER_IDS[0] if Config.ALLOWED_USER_IDS else 0)
+            if not owner_id:
+                continue
+            digest = await brain.generate_daily_digest(owner_id, GROUP)
+            if digest:
+                await flora_send(digest, log_history=False)
+                _digest_sent_for_date = today
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Idle digest loop error: {e}")
 
 
 @dp.message(F.chat.type == "private")
@@ -552,12 +553,18 @@ async def main():
 
     chat_queue.start()
     reminder_task = asyncio.create_task(reminder_loop())
+    digest_task = asyncio.create_task(idle_digest_loop())
     try:
         await dp.start_polling(bot)
     finally:
         reminder_task.cancel()
+        digest_task.cancel()
         try:
             await reminder_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await digest_task
         except asyncio.CancelledError:
             pass
 

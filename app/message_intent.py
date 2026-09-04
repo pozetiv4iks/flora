@@ -1,5 +1,6 @@
-"""Detect whether a group message is meant for Flora."""
-from __future__ import annotations
+import random
+
+BANTER_TRIGGERS = ("лол", "ахах", "ржу", "кринж", "жесть", "блин", "офиг", "пипец", "мда", "ну и", "серьёзно", " seriously")
 
 QUESTION_MARKERS = (
     "?", "подтверд", "какой", "какая", "какие", "когда", "сколько", "куда",
@@ -77,3 +78,19 @@ def rule_based_is_for_flora(text: str, sender_name: str, history: list) -> bool 
         return False
 
     return None
+
+
+def should_maybe_banter(text: str) -> bool:
+    """Иногда вклинивается в чужой разговор — не часто."""
+    from app.config import Config
+    t = (text or "").strip()
+    if len(t) < 4 or len(t) > 180:
+        return False
+    lower = t.lower()
+    if any(m in lower for m in GROUP_CHAT_MARKERS):
+        return False
+    if "flora" in lower or "флора" in lower:
+        return False
+    trigger = any(w in lower for w in BANTER_TRIGGERS)
+    chance = Config.BANTER_RESPONSE_CHANCE * (2.5 if trigger else 1.0)
+    return random.random() < min(chance, 0.22)

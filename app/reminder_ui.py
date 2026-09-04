@@ -45,7 +45,7 @@ def format_save_proposal(tool_call: dict) -> str:
         title = tool_call.get("title", "")
         date = tool_call.get("event_date") or "?"
         time = tool_call.get("event_time")
-        mins = tool_call.get("remind_minutes_before") or 30
+        mins = tool_call.get("remind_minutes_before") or 15
         lines = [f"📅 {title}", f"Дата: {date}"]
         if time:
             lines.append(f"Время: {time}")

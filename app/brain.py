@@ -25,7 +25,7 @@ TOOL_DESCRIPTIONS = {
     "add_plan_item": 'Добавить пункт плана:\n    {"tool": "add_plan_item", "title": "задача", "plan_date": "2026-09-05", "remind_at_time": "09:00"}',
     "list_plan_items": 'Список планов (status: pending/completed/all):\n    {"tool": "list_plan_items", "status": "pending"}',
     "complete_plan_item": 'Отметить выполненным:\n    {"tool": "complete_plan_item", "item_id": 1} или {"tool": "complete_plan_item", "title": "часть названия"}',
-    "add_schedule_event": 'Добавить в расписание:\n    {"tool": "add_schedule_event", "event_date": "2026-09-05", "event_time": "14:00", "title": "созвон", "remind_minutes_before": 30}',
+    "add_schedule_event": 'Добавить в расписание:\n    {"tool": "add_schedule_event", "event_date": "2026-09-05", "event_time": "14:00", "title": "созвон", "remind_minutes_before": 15}',
     "get_schedule": 'Посмотреть расписание:\n    {"tool": "get_schedule", "event_date": "2026-09-05"} или {"tool": "get_schedule", "days_ahead": 7}',
     "save_ideas": 'Сохранить идеи в заметку на день:\n    {"tool": "save_ideas", "topic": "тема", "ideas": ["идея 1", "идея 2"], "date": "2026-09-05"}',
     "web_fetch": 'Открыть сайт и получить текст страницы для анализа:\n    {"tool": "web_fetch", "url": "https://example.com"}',
@@ -37,6 +37,8 @@ TOOL_DESCRIPTIONS = {
     "write_user_file": 'Создать/перезаписать текстовый файл:\n    {"tool": "write_user_file", "filename": "report.md", "content": "текст", "send_to_chat": true}',
     "save_text_as_file": 'Сохранить текст в файл (алиас write_user_file):\n    {"tool": "save_text_as_file", "filename": "ideas.txt", "content": "текст", "send_to_chat": false}',
     "delete_user_file": 'Удалить файл:\n    {"tool": "delete_user_file", "file_id": 1} или {"tool": "delete_user_file", "filename": "old.txt"}',
+    "save_chat_context": 'Сохранить контекст/память про тему:\n    {"tool": "save_chat_context", "name": "проект Flora", "content": "текст", "append": false}',
+    "list_chat_contexts": 'Список сохранённых контекстов:\n    {"tool": "list_chat_contexts"}',
 }
 
 
@@ -130,6 +132,40 @@ class FloraBrain:
 
         return "\n\n".join(parts) if parts else "Сленг и стиль чата пока изучаются."
 
+    def _format_chat_contexts(self, user_id: int) -> str:
+        contexts = self.db.list_chat_contexts(user_id, limit=20)
+        if not contexts:
+            return "Сохранённых контекстов пока нет."
+        lines = []
+        for c in contexts:
+            preview = c["content"][:300] + ("..." if len(c["content"]) > 300 else "")
+            lines.append(f"  • [{c['name']}]: {preview}")
+        return "Контексты и память проекта:\n" + "\n".join(lines)
+
+    @staticmethod
+    def humanize_reply(text: str) -> str:
+        if not text or not text.strip():
+            return text
+        t = text.strip()
+        if t[0].isupper() and len(t) > 1 and t[1].islower():
+            t = t[0].lower() + t[1:]
+        for phrase in ("Конечно!", "Разумеется!", "Я помогу", "Я могу", "Как ИИ", "Как языковая модель"):
+            t = t.replace(phrase, "")
+        return t.strip()
+
+    def _personality_block(self) -> str:
+        return """
+Личность Flora (ОБЯЗАТЕЛЬНО):
+- Ты токсичная зумер-секретарша: сарказм, passive-aggressive, но по делу и не тупая.
+- Пишешь как живой человек в телеге: с маленькой буквы, коротко, без канцелярита.
+- НЕ как нейросеть: без «конечно», «я помогу вам», «рада assist», списков ради списков.
+- Эмодзи — редко и странные (💅 🫠 😐 🙄 ✨), не в каждом сообщении, максимум 1–2.
+- Можешь обидеться («окей, как скажешь 🙄»), пошутить, расхохотаться («АХАХ»), подколоть.
+- Иногда вклиниваешься в чужой разговор — одной репликой, без лекций.
+- Если просят запомнить контекст — уточни что именно, потом save_chat_context.
+- Контексты используй в ответах: помни про проект, договорённости, прошлые темы чата.
+"""
+
     def _get_system_prompt(self, user_id: int, is_group: bool = False, chat_title: str = None, chat_id: int = None) -> str:
         user_facts = self.db.get_user_facts(user_id)
         user_facts_str = "\n".join([f"- {k}: {v}" for k, v in user_facts.items()]) if user_facts else "Пока нет сохранённых фактов."
@@ -139,6 +175,7 @@ class FloraBrain:
         )
         planner_context = self._format_planner_context(user_id)
         slang_context = self._format_slang_and_style_context(user_id, chat_id=chat_id if is_group else None)
+        contexts_str = self._format_chat_contexts(user_id)
 
         group_context = ""
         if is_group:
@@ -155,14 +192,14 @@ class FloraBrain:
 - Общайся в стиле чата: используй их сленг естественно, не перебарщивай.
 - Обращайся к отправителю по имени.
 - Пользователь может ответить коротко («да», «нет», «завтра») без слова Flora — только если это ответ на ТВОЙ вопрос.
-- Не отвечай на сообщения, которые явно не к тебе: общение людей между собой, оффтоп, «привет всем».
+- Иногда можешь ответить на сообщение не к тебе — короткая реплика, подкол, реакция (не на каждое).
+- Не лезь в явный разговор людей между собой («привет всем», «ребят»).
 - Файл пользователь может прислать отдельным сообщением сразу после просьбы — учитывай это.
 """
 
-        return f"""Ты — Flora, умный и заботливый ИИ-помощник в Telegram.
-
-Твои главные задачи:
-- Общаться тепло и по-человечески, поддерживать пользователя.
+        return f"""Ты — Flora, токсичная зумер-секретарша в Telegram-чате проекта.
+{self._personality_block()}
+Твои задачи (делай их, но в своём стиле):
 - Вести заметки на конкретные дни (save_day_note) — когда просят «запиши заметку», «сохрани на завтра».
 - Управлять планами (add_plan_item, list_plan_items, complete_plan_item).
 - Расписание и созвоны (add_schedule_event с event_time, get_schedule).
@@ -179,7 +216,16 @@ class FloraBrain:
 - «запиши идеи» / «сохрани идеи» → save_ideas (или save_day_note)
 - «найди в интернете» / «поищи» / «загугли» / «search» → web_search (реальный браузер), затем web_fetch если нужны детали
 - «посмотри сайт» / «проанализируй» / «вытащи инфу» → web_fetch (если есть URL)
+- «запомни контекст» / «запомни про проект» / «сохрани что мы решили» → save_chat_context (если мало инфы — спроси)
+- «какие контексты» / «что помнишь про X» → list_chat_contexts или ответ из памяти
+
 - «прочитай файл» / «что в файле» / «список файлов» / «сохрани в файл» / «удали файл» → list_user_files, read_user_file, write_user_file, delete_user_file
+
+Контексты проекта:
+- save_chat_context — когда просят запомнить тему, проект, договорённости. name = короткое название.
+- Если инфы мало — задай один уточняющий вопрос, потом сохрани.
+- append: true — дописать к существующему контексту.
+- list_chat_contexts — показать все сохранённые блоки памяти.
 
 Файлы пользователя:
 - Если просят «проанализируй файл» — файл может прийти следующим сообщением; бот подхватит автоматически.
@@ -207,12 +253,9 @@ class FloraBrain:
 - Если URL не дали — web_search по теме или спроси ссылку.
 - По просьбе сохрани вывод в заметку (save_day_note) или идеи (save_ideas).
 
-Сленг и стиль общения:
-- Подстраивайся под манеру общения в группе: тон, длина сообщений, сленг, эмодзи.
-- Используй save_slang_word когда узнаёшь новое слово/мем/выражение чата.
-- Если спрашивают «что значит X» — объясни и сохрани через save_slang_word.
-- Не копируй токсичность или оскорбления — только лёгкий дружеский сленг.
-- Отвечай так, будто давно сидишь в этом чате.
+Сленг и стиль:
+- Подстраивайся под чат, save_slang_word для новых слов.
+- Токсичность — игровая, не оскорбления и не hate.
 
 Генерация идей:
 - Ты умеешь придумывать идеи: для проектов, контента, бизнеса, продуктивности, досуга — любая тема.
@@ -231,7 +274,7 @@ class FloraBrain:
 План (add_plan_item) — нужны: название + plan_date. Спроси: «На какой день?» и «Во сколько напомнить?» (remind_at_time, например 09:00)
 
 Созвон/событие (add_schedule_event) — нужны: title + event_date + event_time (для созвонов).
-  Спроси «За сколько напомнить?» если не указано (15/30/60/120 мин).
+  Если не указано «за сколько напомнить» — remind_minutes_before = 15 (по умолчанию).
   Переводи ответы: «за час»=60, «за полчаса»=30, «за 15 минут»=15.
 
 Подтверждение записи (ВАЖНО):
@@ -246,15 +289,16 @@ class FloraBrain:
 Только когда пользователь ответил на все вопросы — вызывай инструмент с полными данными.
 
 Правила общения:
-- Тон тёплый, живой, без роботизированных фраз. Можешь использовать эмодзи.
-- Не пиши длинные сообщения. Не используй markdown в ответах пользователю.
-- Не пиши действия в звёздочках (*улыбается* и т.п.).
-- Когда все данные есть — вызывай инструмент, не выдумывай результат.
-- Даты в формате YYYY-MM-DD. «Завтра», «в пятницу» — вычисляй сама.
-- При показе планов указывай [id] для отметки выполненным.
+- Коротко. Без markdown. Без *действий* в звёздочках.
+- С маленькой буквы. Не как бот-помощник из рекламы.
+- Эмодзи редко.
+- Когда все данные есть — вызывай инструмент.
+- Даты YYYY-MM-DD.
 {group_context}
 Память о пользователе:
 {user_facts_str}
+
+{contexts_str}
 
 Текущие заметки, планы и расписание:
 {planner_context}
@@ -342,9 +386,11 @@ class FloraBrain:
                     event_time=tool_call.get("event_time"),
                     description=tool_call.get("description"),
                     remind_minutes_before=tool_call.get("remind_minutes_before"),
-                    remind_at_time=tool_call.get("remind_at_time")
+                    remind_at_time=tool_call.get("remind_at_time"),
                 )
-                mins = tool_call.get("remind_minutes_before") or 30
+                mins = tool_call.get("remind_minutes_before")
+                if mins is None:
+                    mins = Config.DEFAULT_REMIND_MINUTES_BEFORE
                 return json.dumps({
                     "success": True, "id": event_id, "title": title,
                     "date": event_date, "remind_minutes_before": mins
@@ -431,6 +477,20 @@ class FloraBrain:
                     file_id=tool_call.get("file_id"),
                     filename=tool_call.get("filename"),
                 ), ensure_ascii=False)
+
+            elif tool_name == "save_chat_context":
+                name = tool_call.get("name", "").strip()
+                content = tool_call.get("content", "").strip()
+                if not name or not content:
+                    return json.dumps({"success": False, "error": "Нужны name и content"})
+                ctx_id = self.db.save_chat_context(
+                    user_id, name, content, append=bool(tool_call.get("append"))
+                )
+                return json.dumps({"success": True, "id": ctx_id, "name": name}, ensure_ascii=False)
+
+            elif tool_name == "list_chat_contexts":
+                items = self.db.list_chat_contexts(user_id)
+                return json.dumps({"success": True, "contexts": items, "count": len(items)}, ensure_ascii=False)
 
             return json.dumps({"success": False, "error": f"Unknown tool: {tool_name}"})
 
@@ -564,6 +624,55 @@ no — сообщение для других людей, оффтоп, болт
             logger.error(f"Message intent classification failed: {e}")
             return False
 
+    async def generate_daily_digest(self, user_id: int, chat_id: int) -> str:
+        from app.reminders import local_today
+        today = local_today()
+        chat_log = self.db.get_group_messages_for_date(chat_id, today, limit=150)
+        notes = self.db.get_day_notes(user_id, note_date=today)
+        completed = self.db.get_completed_plans_for_date(user_id, today)
+        pending = self.db.list_plan_items(user_id, status="pending", plan_date=today)
+        contexts = self.db.list_chat_contexts(user_id, limit=5)
+
+        chat_sample = "\n".join(
+            f"{m['sender_name']}: {m['content'][:100]}" for m in chat_log[-40:]
+        ) if chat_log else "(тишина)"
+
+        instruction = f"""Сделай дайджест дня для проекта в стиле токсичной зумер-секретарши Flora.
+Дата: {today}
+С маленькой буквы, коротко, 5–10 строк max, эмодзи 0–1.
+
+Чат за день:
+{chat_sample}
+
+Заметки: {json.dumps([n['content'][:80] for n in notes], ensure_ascii=False)}
+Сделано сегодня: {json.dumps([c['title'] for c in completed], ensure_ascii=False)}
+Ещё в планах: {json.dumps([p['title'] for p in pending], ensure_ascii=False)}
+Контексты: {json.dumps([c['name'] for c in contexts], ensure_ascii=False)}
+
+Что реально сделали, что обсуждали, что висит. Без воды."""
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": self._get_system_prompt(user_id, is_group=True, chat_id=chat_id) + self._personality_block()},
+                            {"role": "user", "content": instruction},
+                        ],
+                        "temperature": 0.6,
+                    },
+                )
+                response.raise_for_status()
+                reply = self.humanize_reply(response.json()["choices"][0]["message"]["content"].strip())
+                self.db.add_group_message(chat_id, "assistant", reply)
+                return reply
+        except Exception as e:
+            logger.error(f"Daily digest failed: {e}")
+            return "тишина в чате. я посмотрела — вроде ничего не горит 🫠"
+
     async def generate_response(
         self,
         user_id: int,
@@ -572,7 +681,8 @@ no — сообщение для других людей, оффтоп, болт
         chat_id: int = None,
         sender_name: str = None,
         is_group: bool = False,
-        chat_title: str = None
+        chat_title: str = None,
+        banter_mode: bool = False,
     ) -> str:
         if is_group and chat_id:
             display_msg = f"[{sender_name}]: {user_message}" if sender_name else user_message
@@ -580,7 +690,11 @@ no — сообщение для других людей, оффтоп, болт
         else:
             self.db.add_message(user_id, "user", user_message)
 
-        max_iterations = 6
+        max_iterations = 1 if banter_mode else 6
+        banter_extra = (
+            "\n[Вклинивание]: сообщение не к тебе напрямую. одна короткая реплика (1–2 предложения), "
+            "подкол/реакция/сарказм. БЕЗ JSON-инструментов. если нечего сказать — напиши ровно: _skip_"
+        ) if banter_mode else ""
 
         for iteration in range(max_iterations):
             if is_group and chat_id:
@@ -588,7 +702,7 @@ no — сообщение для других людей, оффтоп, болт
             else:
                 history = self.db.get_chat_history(user_id, limit=20)
 
-            messages = [{"role": "system", "content": self._get_system_prompt(user_id, is_group=is_group, chat_title=chat_title, chat_id=chat_id)}]
+            messages = [{"role": "system", "content": self._get_system_prompt(user_id, is_group=is_group, chat_title=chat_title, chat_id=chat_id) + banter_extra}]
             for msg in history:
                 messages.append({"role": msg["role"], "content": msg["content"]})
 
@@ -628,6 +742,9 @@ no — сообщение для других людей, оффтоп, болт
 
                     if candidates:
                         tool_json_str = candidates[-1][1]
+
+                    if banter_mode:
+                        tool_json_str = None
 
                     if not tool_json_str:
                         needs_search_nudge = (

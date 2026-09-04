@@ -50,6 +50,17 @@ class Config:
         ".xlsx", ".tsv",
     }
 
+    # Напоминания
+    REMINDER_TIMEZONE = "Europe/Minsk"
+    DEFAULT_REMIND_MINUTES_BEFORE = 15
+    REMINDER_CHECK_INTERVAL_SEC = 60
+    REMINDER_GRACE_MINUTES = 3
+
+    # Простой в чате и характер
+    CHAT_IDLE_HOURS = 5
+    IDLE_DIGEST_CHECK_SEC = 600
+    BANTER_RESPONSE_CHANCE = 0.08
+
     @classmethod
     def validate(cls):
         """Validate required configuration variables."""

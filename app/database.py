@@ -1,7 +1,8 @@
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from app.config import Config
+from app.reminders import local_today, now_local
 
 class Database:
     def __init__(self, db_path: str = Config.DATABASE_PATH):
@@ -172,7 +173,7 @@ class Database:
                     title TEXT NOT NULL,
                     description TEXT,
                     reminded INTEGER DEFAULT 0,
-                    remind_minutes_before INTEGER DEFAULT 30,
+                    remind_minutes_before INTEGER DEFAULT 15,
                     remind_at_time TEXT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
@@ -238,6 +239,18 @@ class Database:
                     mime_type TEXT,
                     size INTEGER,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_contexts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(owner_user_id, name)
                 )
             """)
             
@@ -502,7 +515,8 @@ class Database:
                 """INSERT INTO schedule_events
                    (user_id, event_date, event_time, title, description, remind_minutes_before, remind_at_time)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (user_id, event_date, event_time, title, description, remind_minutes_before or 30, remind_at_time)
+                (user_id, event_date, event_time, title, description,
+                 remind_minutes_before or Config.DEFAULT_REMIND_MINUTES_BEFORE, remind_at_time)
             )
             conn.commit()
             return cursor.lastrowid
@@ -526,10 +540,8 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_upcoming_unreminded_events(self, user_id: int, within_hours: int = 24) -> list:
-        from datetime import timedelta
-        now = datetime.now()
-        today = now.strftime("%Y-%m-%d")
-        tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        today = local_today()
+        tomorrow = (now_local() + timedelta(days=1)).strftime("%Y-%m-%d")
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -542,10 +554,8 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_all_unreminded_events(self) -> list:
-        from datetime import timedelta
-        now = datetime.now()
-        today = now.strftime("%Y-%m-%d")
-        tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        today = local_today()
+        tomorrow = (now_local() + timedelta(days=1)).strftime("%Y-%m-%d")
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -558,7 +568,7 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_plans_to_remind(self) -> list:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = local_today()
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -730,3 +740,87 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM user_files WHERE user_id = ? AND id = ?", (user_id, file_id))
             conn.commit()
+
+    # --- Chat Contexts (project/memory blocks) ---
+    def save_chat_context(self, owner_user_id: int, name: str, content: str, append: bool = False) -> int:
+        name = name.strip()
+        now = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if append:
+                cursor.execute(
+                    "SELECT id, content FROM chat_contexts WHERE owner_user_id = ? AND name = ?",
+                    (owner_user_id, name),
+                )
+                row = cursor.fetchone()
+                if row:
+                    merged = row["content"].rstrip() + "\n" + content.strip()
+                    cursor.execute(
+                        "UPDATE chat_contexts SET content = ?, updated_at = ? WHERE id = ?",
+                        (merged, now, row["id"]),
+                    )
+                    conn.commit()
+                    return row["id"]
+            cursor.execute(
+                """INSERT INTO chat_contexts (owner_user_id, name, content, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(owner_user_id, name) DO UPDATE SET
+                   content = excluded.content, updated_at = excluded.updated_at""",
+                (owner_user_id, name, content.strip(), now, now),
+            )
+            conn.commit()
+            cursor.execute(
+                "SELECT id FROM chat_contexts WHERE owner_user_id = ? AND name = ?",
+                (owner_user_id, name),
+            )
+            return cursor.fetchone()["id"]
+
+    def list_chat_contexts(self, owner_user_id: int, limit: int = 30) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT id, name, content, updated_at FROM chat_contexts
+                   WHERE owner_user_id = ? ORDER BY updated_at DESC LIMIT ?""",
+                (owner_user_id, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_chat_context(self, owner_user_id: int, name: str) -> dict | None:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, name, content, updated_at FROM chat_contexts WHERE owner_user_id = ? AND name = ?",
+                (owner_user_id, name.strip()),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_last_group_log_timestamp(self, chat_id: int) -> str | None:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT timestamp FROM group_message_log WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+                (chat_id,),
+            )
+            row = cursor.fetchone()
+            return row["timestamp"] if row else None
+
+    def get_group_messages_for_date(self, chat_id: int, date_str: str, limit: int = 200) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT sender_name, content, timestamp FROM group_message_log
+                   WHERE chat_id = ? AND date(timestamp) = ? ORDER BY id ASC LIMIT ?""",
+                (chat_id, date_str, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_completed_plans_for_date(self, user_id: int, date_str: str) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT id, title, completed_at FROM plan_items
+                   WHERE user_id = ? AND status = 'completed' AND date(completed_at) = ?""",
+                (user_id, date_str),
+            )
+            return [dict(row) for row in cursor.fetchall()]
