@@ -183,9 +183,94 @@ class WebBrowserTool:
             finally:
                 await browser.close()
 
+    async def search_in_browser(self, query: str) -> Dict[str, Any]:
+        """Search the web using a real headless browser (Playwright)."""
+        from urllib.parse import quote_plus
+
+        logger.info(f"Browser search for: '{query}'...")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=self.headless)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+                locale="ru-RU",
+            )
+            page = await context.new_page()
+            try:
+                await page.goto(
+                    f"https://duckduckgo.com/?q={quote_plus(query)}&ia=web",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                await page.wait_for_timeout(2500)
+
+                results = await page.evaluate("""() => {
+                    const items = [];
+                    const seen = new Set();
+                    const articles = document.querySelectorAll('article[data-testid="result"]');
+                    articles.forEach(art => {
+                        const a = art.querySelector('[data-testid="result-title-a"]');
+                        const snippet = art.querySelector('[data-result="snippet"]');
+                        if (a && a.href && !seen.has(a.href)) {
+                            seen.add(a.href);
+                            items.push({
+                                title: a.innerText.trim(),
+                                url: a.href,
+                                snippet: snippet ? snippet.innerText.trim() : ''
+                            });
+                        }
+                    });
+                    if (items.length === 0) {
+                        document.querySelectorAll('.result').forEach(block => {
+                            const a = block.querySelector('.result__a');
+                            const snippet = block.querySelector('.result__snippet');
+                            if (a && a.href && !seen.has(a.href)) {
+                                seen.add(a.href);
+                                items.push({
+                                    title: a.innerText.trim(),
+                                    url: a.href,
+                                    snippet: snippet ? snippet.innerText.trim() : ''
+                                });
+                            }
+                        });
+                    }
+                    return items;
+                }""")
+
+                if results:
+                    logger.info(f"Browser search found {len(results)} results")
+                    return {"success": True, "query": query, "results": results[:8], "source": "browser"}
+
+                html = await page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                fallback = []
+                for link in soup.select("a.result__a, a[data-testid='result-title-a']")[:8]:
+                    href = link.get("href", "")
+                    title = link.get_text(strip=True)
+                    if href and title:
+                        fallback.append({"title": title, "url": href, "snippet": ""})
+                if fallback:
+                    return {"success": True, "query": query, "results": fallback, "source": "browser"}
+
+                return {"success": False, "error": "Браузер не нашёл результатов по запросу"}
+            except Exception as e:
+                logger.error(f"Browser search failed: {e}")
+                return {"success": False, "error": str(e)}
+            finally:
+                await browser.close()
+
     async def search_web(self, query: str) -> Dict[str, Any]:
-        """Search the web for a query using Yahoo Search as primary and DuckDuckGo HTML/Lite as backup."""
-        logger.info(f"Searching web for query: '{query}'...")
+        """Search the web: Playwright browser first, then HTTP fallbacks."""
+        browser_result = await self.search_in_browser(query)
+        if browser_result.get("success"):
+            return browser_result
+
+        logger.info(f"Browser search failed, falling back to HTTP search for: '{query}'")
+        return await self._search_web_http(query)
+
+    async def _search_web_http(self, query: str) -> Dict[str, Any]:
+        """HTTP-based search fallback (Yahoo + DuckDuckGo)."""
+        logger.info(f"HTTP search for query: '{query}'...")
         import httpx
         from urllib.parse import quote_plus, unquote
         

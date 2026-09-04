@@ -6,6 +6,7 @@ from typing import Dict, Any
 import httpx
 from app.config import Config
 from app.database import Database
+from app.tools.browser_tool import WebBrowserTool
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,10 @@ TOOL_DESCRIPTIONS = {
     "add_schedule_event": 'Добавить в расписание:\n    {"tool": "add_schedule_event", "event_date": "2026-09-05", "event_time": "14:00", "title": "созвон", "remind_minutes_before": 30}',
     "get_schedule": 'Посмотреть расписание:\n    {"tool": "get_schedule", "event_date": "2026-09-05"} или {"tool": "get_schedule", "days_ahead": 7}',
     "save_ideas": 'Сохранить идеи в заметку на день:\n    {"tool": "save_ideas", "topic": "тема", "ideas": ["идея 1", "идея 2"], "date": "2026-09-05"}',
+    "web_fetch": 'Открыть сайт и получить текст страницы для анализа:\n    {"tool": "web_fetch", "url": "https://example.com"}',
+    "web_search": 'Поиск в браузере/интернете:\n    {"tool": "web_search", "query": "поисковый запрос"}',
+    "save_slang_word": 'Запомнить сленг/слово чата:\n    {"tool": "save_slang_word", "word": "слово", "meaning": "значение", "usage_example": "пример"}',
+    "list_slang_words": 'Показать сохранённый сленг:\n    {"tool": "list_slang_words"}',
 }
 
 
@@ -28,6 +33,7 @@ class FloraBrain:
         self.api_key = Config.LLM_API_KEY
         self.base_url = Config.LLM_BASE_URL
         self.model = Config.LLM_MODEL
+        self.browser = WebBrowserTool(self.db)
 
     def _format_planner_context(self, user_id: int) -> str:
         from datetime import datetime
@@ -64,7 +70,26 @@ class FloraBrain:
 
         return "\n\n".join(parts)
 
-    def _get_system_prompt(self, user_id: int, is_group: bool = False, chat_title: str = None) -> str:
+    def _format_slang_and_style_context(self, user_id: int, chat_id: int = None) -> str:
+        parts = []
+        slang = self.db.get_slang_words(user_id, limit=30)
+        if slang:
+            lines = [f"  • {s['word']}" + (f" — {s['meaning']}" if s.get('meaning') else "") for s in slang]
+            parts.append("Сленг и слова вашего чата:\n" + "\n".join(lines))
+
+        style = self.db.get_user_facts(user_id).get("Стиль общения")
+        if style:
+            parts.append(f"Как вы общаетесь в чате:\n{style}")
+
+        if chat_id:
+            recent = self.db.get_recent_group_messages(chat_id, limit=15)
+            if recent:
+                sample = "\n".join([f"  [{m['sender_name']}]: {m['content'][:120]}" for m in recent[-10:]])
+                parts.append(f"Недавние сообщения в группе (для тона):\n{sample}")
+
+        return "\n\n".join(parts) if parts else "Сленг и стиль чата пока изучаются."
+
+    def _get_system_prompt(self, user_id: int, is_group: bool = False, chat_title: str = None, chat_id: int = None) -> str:
         user_facts = self.db.get_user_facts(user_id)
         user_facts_str = "\n".join([f"- {k}: {v}" for k, v in user_facts.items()]) if user_facts else "Пока нет сохранённых фактов."
 
@@ -72,6 +97,7 @@ class FloraBrain:
             f"{i + 1}. {desc}" for i, desc in enumerate(TOOL_DESCRIPTIONS.values())
         )
         planner_context = self._format_planner_context(user_id)
+        slang_context = self._format_slang_and_style_context(user_id, chat_id=chat_id if is_group else None)
 
         group_context = ""
         if is_group:
@@ -84,6 +110,8 @@ class FloraBrain:
 - Задачи на день — через add_plan_item с plan_date.
 - Напоминания о планах и созвонах Flora автоматически шлёт сюда в группу.
 - Можешь генерировать идеи по запросу — коротко, 3–4 пункта.
+- Можешь смотреть сайты (web_fetch) и искать в браузере (web_search).
+- Общайся в стиле чата: используй их сленг естественно, не перебарщивай.
 - Обращайся к отправителю по имени.
 """
 
@@ -95,6 +123,7 @@ class FloraBrain:
 - Управлять планами (add_plan_item, list_plan_items, complete_plan_item).
 - Расписание и созвоны (add_schedule_event с event_time, get_schedule).
 - Запоминать факты о пользователе через save_user_fact.
+- Смотреть сайты, анализировать информацию и давать фидбек (web_fetch, web_search).
 
 Когда пользователь просит:
 - «запиши заметку» / «заметка на пятницу» → save_day_note
@@ -104,6 +133,29 @@ class FloraBrain:
 - «готово» / «сделано» → complete_plan_item
 - «придумай идеи» / «дай идеи для...» / «что можно сделать» → сгенерируй идеи прямо в ответе (инструмент не нужен)
 - «запиши идеи» / «сохрани идеи» → save_ideas (или save_day_note)
+- «найди в интернете» / «поищи» / «загугли» / «search» → web_search (реальный браузер), затем web_fetch если нужны детали
+- «посмотри сайт» / «проанализируй» / «вытащи инфу» → web_fetch (если есть URL)
+
+Поиск в браузере (ВАЖНО):
+- Если просят найти, поискать, загуглить — ОБЯЗАТЕЛЬНО web_search. Не отвечай из памяти о свежих фактах.
+- После web_search: кратко перескажи топ-3 результата со ссылками.
+- Если нужны детали с конкретной страницы — web_fetch по лучшей ссылке, потом фидбек.
+- Если запрос слишком размытый — один уточняющий вопрос («что именно искать?»).
+
+Анализ сайтов (ВАЖНО):
+- Если дали URL — сначала web_fetch, потом на основе текста страницы дай фидбек.
+- Фидбек строй строго под запрос пользователя: цены, контакты, pros/cons, summary, конкуренты — что попросили.
+- Структурируй ответ: краткий вывод в начале, потом пункты с фактами с сайта.
+- Не выдумывай — только то, что реально есть в результате web_fetch. Если данных нет на странице — скажи честно.
+- Если URL не дали — web_search по теме или спроси ссылку.
+- По просьбе сохрани вывод в заметку (save_day_note) или идеи (save_ideas).
+
+Сленг и стиль общения:
+- Подстраивайся под манеру общения в группе: тон, длина сообщений, сленг, эмодзи.
+- Используй save_slang_word когда узнаёшь новое слово/мем/выражение чата.
+- Если спрашивают «что значит X» — объясни и сохрани через save_slang_word.
+- Не копируй токсичность или оскорбления — только лёгкий дружеский сленг.
+- Отвечай так, будто давно сидишь в этом чате.
 
 Генерация идей:
 - Ты умеешь придумывать идеи: для проектов, контента, бизнеса, продуктивности, досуга — любая тема.
@@ -141,6 +193,9 @@ class FloraBrain:
 
 Текущие заметки, планы и расписание:
 {planner_context}
+
+Сленг и стиль вашего чата:
+{slang_context}
 
 Инструменты (JSON-блок в конце сообщения, один за раз):
 {tools_str}
@@ -250,6 +305,37 @@ class FloraBrain:
                 note_id = self.db.add_day_note(user_id, note_date, content)
                 return json.dumps({"success": True, "id": note_id, "date": note_date, "count": len(ideas)})
 
+            elif tool_name == "web_fetch":
+                url = tool_call.get("url", "").strip()
+                if not url:
+                    return json.dumps({"success": False, "error": "Нужен url"})
+                if not url.startswith(("http://", "https://")):
+                    url = "https://" + url
+                res = await self.browser.fetch_page_content(url, user_id=user_id)
+                return json.dumps(res, ensure_ascii=False)
+
+            elif tool_name == "web_search":
+                query = tool_call.get("query", "").strip()
+                if not query:
+                    return json.dumps({"success": False, "error": "Нужен query"})
+                res = await self.browser.search_web(query)
+                return json.dumps(res, ensure_ascii=False)
+
+            elif tool_name == "save_slang_word":
+                word = tool_call.get("word", "").strip()
+                if not word:
+                    return json.dumps({"success": False, "error": "Нужно word"})
+                self.db.add_slang_word(
+                    user_id, word,
+                    meaning=tool_call.get("meaning"),
+                    usage_example=tool_call.get("usage_example")
+                )
+                return json.dumps({"success": True, "word": word})
+
+            elif tool_name == "list_slang_words":
+                words = self.db.get_slang_words(user_id)
+                return json.dumps({"success": True, "slang": words, "count": len(words)})
+
             return json.dumps({"success": False, "error": f"Unknown tool: {tool_name}"})
 
         except Exception as e:
@@ -272,7 +358,7 @@ class FloraBrain:
         else:
             self.db.add_message(user_id, "user", user_message)
 
-        max_iterations = 3
+        max_iterations = 4
 
         for iteration in range(max_iterations):
             if is_group and chat_id:
@@ -280,7 +366,7 @@ class FloraBrain:
             else:
                 history = self.db.get_chat_history(user_id, limit=20)
 
-            messages = [{"role": "system", "content": self._get_system_prompt(user_id, is_group=is_group, chat_title=chat_title)}]
+            messages = [{"role": "system", "content": self._get_system_prompt(user_id, is_group=is_group, chat_title=chat_title, chat_id=chat_id)}]
             for msg in history:
                 messages.append({"role": msg["role"], "content": msg["content"]})
 
@@ -288,7 +374,7 @@ class FloraBrain:
             payload = {"model": self.model, "messages": messages, "temperature": 0.7}
 
             try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with httpx.AsyncClient(timeout=90.0) as client:
                     response = await client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
                     response.raise_for_status()
                     reply = response.json()["choices"][0]["message"]["content"]
@@ -365,13 +451,13 @@ class FloraBrain:
                             final_history = self.db.get_chat_history(user_id, limit=20)
                         final_messages = [{
                             "role": "system",
-                            "content": self._get_system_prompt(user_id, is_group=is_group, chat_title=chat_title)
-                            + "\nИнструменты отключены. Напиши короткий понятный ответ с результатом."
+                            "content": self._get_system_prompt(user_id, is_group=is_group, chat_title=chat_title, chat_id=chat_id)
+                            + "\nИнструменты отключены. Дай пользователю понятный ответ: если был web_fetch — полный фидбек по его запросу на основе текста страницы."
                         }]
                         for msg in final_history:
                             final_messages.append({"role": msg["role"], "content": msg["content"]})
 
-                        async with httpx.AsyncClient(timeout=60.0) as client:
+                        async with httpx.AsyncClient(timeout=90.0) as client:
                             final_response = await client.post(
                                 f"{self.base_url}/chat/completions",
                                 headers=headers,
@@ -398,14 +484,63 @@ class FloraBrain:
             history = self.db.get_chat_history(user_id, limit=1)
         return history[-1]["content"] if history else "Готово, но что-то пошло не так с ответом."
 
+    async def analyze_group_chat(self, owner_user_id: int, chat_id: int):
+        """Background: learn slang and communication style from recent group messages."""
+        recent = self.db.get_recent_group_messages(chat_id, limit=50)
+        if len(recent) < 8:
+            return
+
+        chat_log = "\n".join([f"{m['sender_name']}: {m['content']}" for m in recent])
+        existing_slang = self.db.get_slang_words(owner_user_id, limit=20)
+
+        instruction = """Проанализируй переписку группового чата. Верни ТОЛЬКО JSON:
+{
+  "chat_style": "2-4 предложения: как люди общаются (тон, сленг, длина, эмодзи, обращения)",
+  "slang_words": [
+    {"word": "слово", "meaning": "значение", "usage_example": "пример из чата"}
+  ]
+}
+slang_words — только реальный сленг/мемы/жargon из сообщений, не больше 5 новых. Если нового нет — []."""
+
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                    json={"model": self.model, "messages": [
+                        {"role": "system", "content": instruction},
+                        {"role": "user", "content": f"Уже известный сленг:\n{json.dumps(existing_slang, ensure_ascii=False)}\n\nЧат:\n{chat_log}"}
+                    ], "temperature": 0.3}
+                )
+                response.raise_for_status()
+                raw = response.json()["choices"][0]["message"]["content"].strip()
+                if raw.startswith("```"):
+                    raw = re.sub(r"^```(?:json)?\n", "", raw)
+                    raw = re.sub(r"\n```$", "", raw)
+                data = json.loads(raw)
+                if data.get("chat_style"):
+                    self.db.set_user_fact(owner_user_id, "Стиль общения", data["chat_style"])
+                for item in data.get("slang_words", []):
+                    if item.get("word"):
+                        self.db.add_slang_word(
+                            owner_user_id, item["word"],
+                            meaning=item.get("meaning"),
+                            usage_example=item.get("usage_example")
+                        )
+        except Exception as e:
+            logger.error(f"Group chat analysis failed: {e}")
+
     async def auto_learn_from_turn(self, user_id: int, user_msg: str, assistant_reply: str):
-        """Extract user facts from conversation in background."""
+        """Extract user facts and slang from conversation in background."""
         user_facts = self.db.get_user_facts(user_id)
         context_str = f'Пользователь: "{user_msg}"\nFlora: "{assistant_reply}"\n\nИзвестные факты:\n{json.dumps(user_facts, ensure_ascii=False)}'
 
-        instruction = """Извлеки новые факты о пользователе (имя, предпочтения, дела). Верни только JSON:
-{"user_facts": {"Ключ": "Значение"}}
-Если ничего нового — {"user_facts": {}}"""
+        instruction = """Извлеки из реплики новые факты и сленг. Верни ТОЛЬКО JSON:
+{
+  "user_facts": {"Ключ": "Значение"},
+  "slang_words": [{"word": "слово", "meaning": "значение"}]
+}
+Если ничего нового — пустые объекты/массивы."""
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -425,5 +560,8 @@ class FloraBrain:
                 data = json.loads(raw)
                 for k, v in data.get("user_facts", {}).items():
                     self.db.set_user_fact(user_id, k, v)
+                for item in data.get("slang_words", []):
+                    if item.get("word"):
+                        self.db.add_slang_word(user_id, item["word"], meaning=item.get("meaning"))
         except Exception as e:
             logger.error(f"Auto-learn failed: {e}")

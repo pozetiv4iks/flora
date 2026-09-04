@@ -33,6 +33,9 @@ class Config:
         except ValueError:
             print("Warning: ALLOWED_USER_IDS has invalid integers.")
 
+    # Единственная группа, где Flora отвечает
+    ALLOWED_GROUP_CHAT_ID = -5377044950
+
     @classmethod
     def validate(cls):
         """Validate required configuration variables."""

@@ -205,6 +205,28 @@ class Database:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS group_message_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    sender_name TEXT,
+                    content TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS slang_words (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER NOT NULL,
+                    word TEXT NOT NULL,
+                    meaning TEXT,
+                    usage_example TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(owner_user_id, word)
+                )
+            """)
             
             conn.commit()
 
@@ -591,3 +613,53 @@ class Database:
             )
             rows = cursor.fetchall()
             return [{"role": r["role"], "content": r["content"], "sender_name": r["sender_name"], "timestamp": r["timestamp"]} for r in reversed(rows)]
+
+    def clear_group_chat_history(self, chat_id: int):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM group_chat_history WHERE chat_id = ?", (chat_id,))
+            conn.commit()
+
+    def log_group_message(self, chat_id: int, sender_name: str, content: str) -> int:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO group_message_log (chat_id, sender_name, content) VALUES (?, ?, ?)",
+                (chat_id, sender_name, content)
+            )
+            cursor.execute("SELECT COUNT(*) AS cnt FROM group_message_log WHERE chat_id = ?", (chat_id,))
+            conn.commit()
+            return cursor.fetchone()["cnt"]
+
+    def get_recent_group_messages(self, chat_id: int, limit: int = 40) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT sender_name, content, timestamp FROM group_message_log WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+                (chat_id, limit)
+            )
+            rows = cursor.fetchall()
+            return [{"sender_name": r["sender_name"], "content": r["content"], "timestamp": r["timestamp"]} for r in reversed(rows)]
+
+    def add_slang_word(self, owner_user_id: int, word: str, meaning: str = None, usage_example: str = None):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO slang_words (owner_user_id, word, meaning, usage_example, created_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(owner_user_id, word) DO UPDATE SET
+                   meaning = excluded.meaning,
+                   usage_example = COALESCE(excluded.usage_example, slang_words.usage_example),
+                   created_at = excluded.created_at""",
+                (owner_user_id, word.lower().strip(), meaning, usage_example, datetime.now().isoformat())
+            )
+            conn.commit()
+
+    def get_slang_words(self, owner_user_id: int, limit: int = 50) -> list:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT word, meaning, usage_example FROM slang_words WHERE owner_user_id = ? ORDER BY id DESC LIMIT ?",
+                (owner_user_id, limit)
+            )
+            return [dict(row) for row in cursor.fetchall()]
