@@ -1,3 +1,5 @@
+import csv
+import io
 import logging
 import os
 from pathlib import Path
@@ -52,30 +54,76 @@ class FileTool:
                 return record
         return None
 
-    def _extract_text(self, path: str, mime_type: str = None) -> tuple[str | None, str | None]:
+    def is_tabular(self, filename: str) -> bool:
+        return Path(filename).suffix.lower() in {".csv", ".tsv", ".xlsx", ".xls"}
+
+    def _read_xlsx(self, path: str) -> str:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        parts = []
+        for sheet_name in wb.sheetnames[:3]:
+            ws = wb[sheet_name]
+            rows = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= 200:
+                    rows.append("...[строки обрезаны]")
+                    break
+                cells = ["" if c is None else str(c) for c in row]
+                if any(cells):
+                    rows.append("\t".join(cells))
+            if rows:
+                parts.append(f"--- Лист: {sheet_name} ---\n" + "\n".join(rows))
+        wb.close()
+        return "\n\n".join(parts) or "(пустая таблица)"
+
+    def _read_csv_text(self, path: str) -> tuple[str, dict]:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            sample = f.read()
+        delimiter = "\t" if path.endswith(".tsv") else ","
+        reader = csv.reader(io.StringIO(sample), delimiter=delimiter)
+        rows = list(reader)
+        meta = {"rows": len(rows), "cols": len(rows[0]) if rows else 0, "is_table": True}
+        if rows:
+            meta["headers"] = rows[0]
+        return sample, meta
+
+    def _extract_text(self, path: str, mime_type: str = None) -> tuple[str | None, str | None, dict]:
+        meta: dict = {"is_table": False}
         ext = Path(path).suffix.lower()
         try:
             if ext == ".pdf":
                 try:
                     from pypdf import PdfReader
                 except ImportError:
-                    return None, "PDF не поддерживается: установите pypdf"
+                    return None, "PDF не поддерживается: установите pypdf", meta
                 reader = PdfReader(path)
                 parts = []
                 for page in reader.pages[:30]:
                     parts.append(page.extract_text() or "")
                 text = "\n".join(parts).strip()
-                return (text or "(PDF без извлекаемого текста)", None)
+                return (text or "(PDF без извлекаемого текста)", None, meta)
+
+            if ext == ".xlsx":
+                try:
+                    text = self._read_xlsx(path)
+                    meta["is_table"] = True
+                    return text, None, meta
+                except ImportError:
+                    return None, "Excel не поддерживается: установите openpyxl", meta
+
+            if ext in (".csv", ".tsv"):
+                text, meta = self._read_csv_text(path)
+                return text, None, meta
 
             if ext in TEXT_EXTENSIONS or (mime_type and mime_type.startswith("text/")):
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read(), None
+                    return f.read(), None, meta
 
             size = os.path.getsize(path)
-            return None, f"Бинарный файл ({ext or mime_type or 'unknown'}, {size} байт). Чтение текста недоступно."
+            return None, f"Бинарный файл ({ext or mime_type or 'unknown'}, {size} байт). Пришли txt, csv, pdf или xlsx.", meta
         except Exception as e:
             logger.error(f"Text extraction failed for {path}: {e}")
-            return None, str(e)
+            return None, str(e), meta
 
     def _truncate(self, text: str) -> str:
         limit = Config.MAX_FILE_READ_CHARS
@@ -94,7 +142,7 @@ class FileTool:
         path = record["local_path"]
         if not os.path.exists(path):
             return {"success": False, "error": "Файл на диске не найден"}
-        text, err = self._extract_text(path, record.get("mime_type"))
+        text, err, meta = self._extract_text(path, record.get("mime_type"))
         if err:
             return {"success": False, "error": err, "file_id": record["id"], "name": record["original_name"]}
         return {
@@ -103,6 +151,8 @@ class FileTool:
             "name": record["original_name"],
             "content": self._truncate(text),
             "size": record.get("size"),
+            "is_table": meta.get("is_table") or self.is_tabular(record["original_name"]),
+            "table_meta": meta,
         }
 
     def write_file(
@@ -166,7 +216,7 @@ class FileTool:
         file_id = self.db.add_user_file(
             user_id, telegram_file_id, local_path, original_name, mime_type, size
         )
-        preview, _ = self._extract_text(local_path, mime_type)
+        preview, _, meta = self._extract_text(local_path, mime_type)
         preview_short = (preview[:500] + "...") if preview and len(preview) > 500 else preview
         return {
             "success": True,

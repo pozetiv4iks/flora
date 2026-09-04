@@ -13,6 +13,7 @@ from app.config import Config
 from app.database import Database
 from app.brain import FloraBrain
 from app import reminder_ui as confirm_ui
+from app import file_analysis as fa
 
 logging.basicConfig(
     level=logging.INFO,
@@ -188,6 +189,15 @@ async def reminder_loop():
             break
         except Exception as e:
             logger.error(f"Error in reminder loop: {e}")
+
+
+async def process_file_analysis(message: Message, owner_id: int, file_id: int, request_text: str, sender_name: str, chat_title: str):
+    async with typing_status(bot, message.chat.id):
+        reply_text = await brain.analyze_uploaded_file(
+            owner_id, file_id, request_text,
+            chat_id=GROUP, sender_name=sender_name, chat_title=chat_title,
+        )
+    await message.reply(reply_text)
 
 
 async def process_flora_reply(message: Message, owner_id: int, user_text: str, sender_name: str, chat_title: str):
@@ -389,6 +399,7 @@ async def handle_group_message(message: types.Message):
     owner_id = resolve_owner_user_id(message)
     sender_name = message.from_user.first_name or message.from_user.username or "участник"
     chat_title = message.chat.title or "группа"
+    user_id = message.from_user.id
 
     db.register_group_chat(GROUP, owner_id, chat_title)
 
@@ -398,7 +409,35 @@ async def handle_group_message(message: types.Message):
         if msg_count % 20 == 0:
             asyncio.create_task(brain.analyze_group_chat(owner_id, GROUP))
 
+    # Ожидаем файл от пользователя (после «проанализируй файл»)
+    file_wait = fa.get_file_wait(user_id)
+    if file_wait:
+        if has_attachment:
+            saved = await save_telegram_attachment(message, owner_id)
+            if saved and saved.get("error"):
+                await message.reply(f"Не смогла принять файл: {saved['error']}")
+                return
+            if saved and saved.get("success"):
+                wait = fa.pop_file_wait(user_id)
+                await process_file_analysis(
+                    message, owner_id, saved["file_id"],
+                    wait.get("request_text", "") if wait else "",
+                    sender_name, chat_title,
+                )
+            return
+        if text.strip():
+            await message.reply("Это не файл 📎 Скинь документ, таблицу (csv/xlsx) или pdf.")
+            return
+        return
+
     if not await is_flora_mentioned(message):
+        return
+
+    # «Flora, проанализируй файл» — ждём следующее сообщение с файлом
+    if fa.wants_file_analysis_request(text) and not has_attachment:
+        fa.start_file_wait(user_id, owner_id, text, sender_name)
+        db.add_group_message(GROUP, "assistant", "Хорошо, скидывай файл 📎")
+        await message.reply("Хорошо, скидывай файл 📎")
         return
 
     file_note = ""
@@ -409,6 +448,9 @@ async def handle_group_message(message: types.Message):
             await message.reply(f"Не смогла принять файл: {saved['error']}")
             return
         if saved and saved.get("success"):
+            if fa.wants_file_analysis_request(text) or any(w in text.lower() for w in ("проанализиру", "разбери", "анализ")):
+                await process_file_analysis(message, owner_id, saved["file_id"], text, sender_name, chat_title)
+                return
             preview = saved.get("preview")
             file_note = (
                 f"\n[Файл загружен: id={saved['file_id']}, имя={saved['name']}, "

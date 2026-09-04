@@ -47,6 +47,7 @@ class Config:
         ".txt", ".md", ".json", ".csv", ".yaml", ".yml", ".xml", ".html", ".htm",
         ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".log", ".env", ".ini", ".toml",
         ".sql", ".sh", ".rtf", ".pdf", ".jpg", ".jpeg", ".png", ".webp",
+        ".xlsx", ".tsv",
     }
 
     @classmethod

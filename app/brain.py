@@ -179,8 +179,8 @@ class FloraBrain:
 - «прочитай файл» / «что в файле» / «список файлов» / «сохрани в файл» / «удали файл» → list_user_files, read_user_file, write_user_file, delete_user_file
 
 Файлы пользователя:
-- Пользователь может прикрепить файл в чат — он сохраняется с file_id. Сначала list_user_files если не знаешь id.
-- read_user_file — читай и анализируй содержимое, давай фидбек по запросу.
+- Если просят «проанализируй файл» без вложения — бот попросит скинуть файл; после загрузки анализ придёт автоматически.
+- Если файл уже в сообщении — read_user_file и анализ по запросу.
 - write_user_file / save_text_as_file — создавай текстовые файлы (.txt, .md, .json и т.д.).
 - send_to_chat: true — отправь готовый файл пользователю в чат после сохранения.
 - delete_user_file — только если явно попросили удалить.
@@ -433,6 +433,95 @@ class FloraBrain:
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {e}")
             return json.dumps({"success": False, "error": str(e)})
+
+    async def analyze_uploaded_file(
+        self,
+        user_id: int,
+        file_id: int,
+        request_text: str = "",
+        chat_id: int = None,
+        sender_name: str = None,
+        chat_title: str = None,
+    ) -> str:
+        read_result = self.files.read_file(user_id, file_id=file_id)
+        if not read_result.get("success"):
+            return f"Не смогла прочитать файл: {read_result.get('error', 'ошибка')}"
+
+        name = read_result["name"]
+        content = read_result["content"]
+        is_table = read_result.get("is_table")
+        table_meta = read_result.get("table_meta") or {}
+
+        if chat_id:
+            self.db.add_group_message(
+                chat_id, "user",
+                f"[{sender_name}]: прислал файл «{name}» для анализа",
+                sender_name,
+            )
+
+        if request_text.strip():
+            instruction = request_text.strip()
+        elif is_table:
+            instruction = (
+                "Проанализируй таблицу: столбцы, количество строк, ключевые цифры, "
+                "мин/макс/средние где уместно, закономерности и краткий вывод."
+            )
+        else:
+            instruction = (
+                "Извлеки главное из файла: ключевые значения, факты, структуру. "
+                "Краткий понятный обзор без воды."
+            )
+
+        table_hint = ""
+        if is_table:
+            headers = table_meta.get("headers")
+            rows = table_meta.get("rows")
+            cols = table_meta.get("cols")
+            parts = ["Это табличные данные (csv/tsv/excel)."]
+            if headers:
+                parts.append(f"Заголовки: {', '.join(str(h) for h in headers)}")
+            if rows:
+                parts.append(f"Строк данных: ~{rows}, столбцов: {cols or '?'}")
+            table_hint = "\n".join(parts) + "\n\n"
+
+        analysis_prompt = f"""Запрос пользователя: {instruction}
+
+{table_hint}Файл: «{name}»
+
+Содержимое:
+{content}
+
+Правила ответа:
+- Отвечай на русском, по делу, без markdown-таблиц (списки и абзацы).
+- Только факты из файла, ничего не выдумывай.
+- Если таблица — разбор столбцов, цифры, итоги, выводы.
+- Если обычный текст/документ — суть и ключевые значения."""
+
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        messages = [
+            {
+                "role": "system",
+                "content": self._get_system_prompt(user_id, is_group=True, chat_title=chat_title, chat_id=chat_id),
+            },
+            {"role": "user", "content": analysis_prompt},
+        ]
+
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json={"model": self.model, "messages": messages, "temperature": 0.4},
+                )
+                response.raise_for_status()
+                reply = response.json()["choices"][0]["message"]["content"].strip()
+                if chat_id:
+                    self.db.add_group_message(chat_id, "assistant", reply)
+                asyncio.create_task(self.auto_learn_from_turn(user_id, instruction, reply))
+                return reply
+        except Exception as e:
+            logger.error(f"File analysis failed: {e}")
+            return "Не получилось проанализировать файл, попробуй ещё раз 🥺"
 
     async def generate_response(
         self,
