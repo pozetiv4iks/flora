@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -11,7 +12,7 @@ from aiogram.types import Message, CallbackQuery, FSInputFile
 from app.config import Config
 from app.database import Database
 from app.brain import FloraBrain
-from app import reminder_ui as rw
+from app import reminder_ui as confirm_ui
 
 logging.basicConfig(
     level=logging.INFO,
@@ -204,9 +205,12 @@ async def process_flora_reply(message: Message, owner_id: int, user_text: str, s
             chat_title=chat_title,
         )
 
-    markup = rw.keyboard_for_flora_reply(reply_text)
-    if markup:
-        rw.start_session(message.from_user.id)
+    pending_save = brain.pop_pending_save()
+    if pending_save:
+        confirm_ui.store_pending(message.from_user.id, pending_save)
+        markup = confirm_ui.kb_save_confirm()
+    else:
+        markup = None
     await message.reply(reply_text, reply_markup=markup)
 
     pending = brain.pop_file_to_send()
@@ -269,140 +273,71 @@ async def save_telegram_attachment(message: Message, owner_id: int) -> dict | No
     )
 
 
-def _wants_reminder_wizard(text: str) -> bool:
-    lower = text.lower()
-    return any(w in lower for w in (
-        "напомин", "напомни", "создай напомин", "добавь напомин", "запланируй созвон", "поставь напомин",
-    ))
+def _format_save_done(tool: str, payload: dict, result: dict) -> str:
+    if tool == "save_day_note":
+        return f"Готово ✅\nЗаметка на {payload.get('date') or payload.get('note_date')} сохранена"
+    if tool == "add_plan_item":
+        return f"Готово ✅\nПлан: {payload.get('title')}\nДень: {payload.get('plan_date', '—')}"
+    if tool == "add_schedule_event":
+        time_str = f" в {payload['event_time']}" if payload.get("event_time") else ""
+        return f"Готово ✅\n{payload.get('title')}{time_str}\n{payload.get('event_date')}"
+    if tool == "save_ideas":
+        return f"Готово ✅\nИдеи сохранены ({result.get('count', '?')} шт.)"
+    return "Готово ✅"
 
 
-async def _save_reminder_from_session(owner_id: int, session: dict) -> str:
-    title = session.get("title") or "Напоминание"
-    date = session.get("date")
-    if not date:
-        return "Не выбрана дата — начни заново."
-
-    kind = session.get("kind")
-    before = session.get("before")
-    event_time = session.get("time")
-
-    if kind == "plan" or (kind == "custom" and not event_time):
-        remind_at = "09:00"
-        if before and before.startswith("at:"):
-            remind_at = before.split(":", 1)[1]
-        db.add_plan_item(owner_id, title, plan_date=date, remind_at_time=remind_at)
-        return f"Готово ✅\nПлан: {title}\nДень: {date}\nНапомню в {remind_at}"
-
-    remind_minutes = 30
-    remind_at_time = None
-    if before:
-        if before.startswith("at:"):
-            remind_at_time = before.split(":", 1)[1]
-        else:
-            try:
-                remind_minutes = int(before)
-            except ValueError:
-                remind_minutes = 30
-
-    db.add_schedule_event(
-        owner_id, date, title,
-        event_time=event_time if event_time != "none" else None,
-        remind_minutes_before=remind_minutes,
-        remind_at_time=remind_at_time,
-    )
-    time_str = f" в {event_time}" if event_time and event_time != "none" else ""
-    before_str = f"за {remind_minutes} мин" if not remind_at_time else f"в {remind_at_time}"
-    return f"Готово ✅\n{title}{time_str}\n{date}, напомню {before_str}"
-
-
-@dp.callback_query(F.data.startswith("rw:"))
-async def on_reminder_callback(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("cf:"))
+async def on_confirm_save_callback(callback: CallbackQuery):
     if callback.message.chat.id != GROUP:
         await callback.answer()
         return
 
-    owner_id = resolve_owner_user_id(callback.message)
-    data = callback.data
     user_id = callback.from_user.id
-    session = rw.get_session(user_id) or rw.start_session(user_id)
+    owner_id = resolve_owner_user_id(callback.message)
+    pending = confirm_ui.get_pending(user_id)
+
+    if not pending:
+        await callback.answer("Нечего подтверждать — напиши Flora заново")
+        return
+
+    action = callback.data.split(":")[-1]
 
     try:
-        if data == "rw:confirm:no":
-            rw.reminder_sessions.pop(user_id, None)
+        if action == "no":
+            confirm_ui.clear_pending(user_id)
             await callback.message.edit_text("Отменено.")
             await callback.answer()
             return
 
-        if data == "rw:confirm:yes":
-            result = await _save_reminder_from_session(owner_id, session)
-            rw.reminder_sessions.pop(user_id, None)
-            await callback.message.edit_text(result)
-            await callback.answer("Готово ✅")
+        if action == "replace":
+            confirm_ui.clear_pending(user_id)
+            await callback.message.edit_text("Ок, напиши Flora что изменить — переделаю.")
+            await callback.answer()
             return
 
-        if data.startswith("rw:type:"):
-            kind = data.split(":")[-1]
-            session["kind"] = kind
-            session["step"] = "title" if kind == "custom" else "date"
-            if kind == "call":
-                session["title"] = "Созвон"
-                session["step"] = "date"
-                await callback.message.edit_text("На какой день?", reply_markup=rw.kb_remind_date())
-            elif kind == "plan":
-                session["title"] = "Задача"
-                session["step"] = "date"
-                await callback.message.edit_text("На какой день?", reply_markup=rw.kb_remind_date())
+        if action == "yes":
+            result_raw = await brain.execute_tool(pending["payload"], owner_id)
+            result = json.loads(result_raw)
+            confirm_ui.clear_pending(user_id)
+            if result.get("success"):
+                text = _format_save_done(pending["tool"], pending["payload"], result)
+                db.add_group_message(GROUP, "assistant", text)
             else:
-                await callback.message.edit_text("Напиши Flora: «напомни [что]» — или выбери дату после текста.")
-            await callback.answer()
+                text = f"Не получилось: {result.get('error', 'ошибка')}"
+            await callback.message.edit_text(text)
+            await callback.answer("Готово ✅" if result.get("success") else "Ошибка")
             return
-
-        if data.startswith("rw:date:"):
-            session["date"] = data.split(":", 2)[-1]
-            session["step"] = "time" if session.get("kind") == "call" else "before"
-            if session.get("kind") == "call":
-                await callback.message.edit_text("Во сколько?", reply_markup=rw.kb_remind_time())
-            else:
-                await callback.message.edit_text("За сколько напомнить?", reply_markup=rw.kb_remind_before())
-            await callback.answer()
-            return
-
-        if data.startswith("rw:time:"):
-            session["time"] = data.split(":", 2)[-1]
-            session["step"] = "before"
-            await callback.message.edit_text("За сколько напомнить?", reply_markup=rw.kb_remind_before())
-            await callback.answer()
-            return
-
-        if data.startswith("rw:before:"):
-            raw = data[len("rw:before:"):]
-            session["before"] = raw if raw.startswith("at:") else raw
-            if raw.startswith("at:"):
-                session["before"] = raw
-            summary = (
-                f"Проверь:\n{session.get('title', '?')}\n"
-                f"Дата: {session.get('date')}\n"
-            )
-            if session.get("time") and session["time"] != "none":
-                summary += f"Время: {session['time']}\n"
-            summary += f"Напоминание: {raw.replace('at:', 'в ')}"
-            session["step"] = "confirm"
-            await callback.message.edit_text(summary, reply_markup=rw.kb_remind_confirm("", "", None, None))
-            await callback.answer()
-            return
-
     except Exception as e:
-        logger.error(f"Reminder callback error: {e}")
+        logger.error(f"Confirm save callback error: {e}")
         await callback.answer("Ошибка, попробуй ещё раз")
 
     await callback.answer()
 
 
-@dp.message(Command("remind"), F.chat.id == GROUP)
-async def cmd_remind(message: Message):
-    user_id = message.from_user.id
-    rw.start_session(user_id)
-    await message.reply("Какое напоминание?", reply_markup=rw.kb_remind_type())
+@dp.callback_query(F.data.startswith("rw:"))
+async def on_legacy_reminder_callback(callback: CallbackQuery):
+    """Старые кнопки мастера напоминаний — игнорируем."""
+    await callback.answer("Используй текст: напиши Flora что записать")
 
 
 @dp.message(CommandStart(), F.chat.id == GROUP)
@@ -488,11 +423,6 @@ async def handle_group_message(message: types.Message):
         user_text = f"Пользователь прикрепил файл {saved['name']} (id={saved['file_id']}). Что с ним сделать?"
 
     if not user_text:
-        return
-
-    if _wants_reminder_wizard(text):
-        rw.start_session(message.from_user.id)
-        await message.reply("Какое напоминание?", reply_markup=rw.kb_remind_type())
         return
 
     await process_flora_reply(message, owner_id, user_text, sender_name, chat_title)

@@ -9,12 +9,14 @@ from app.database import Database
 from app.tools.browser_tool import WebBrowserTool
 from app.tools.file_tool import FileTool
 from app.file_permissions import filter_tool_descriptions, is_file_tool_allowed, permissions_summary
+from app.reminder_ui import format_save_proposal
 
 logger = logging.getLogger(__name__)
 
 SEARCH_KEYWORDS = ("найди", "поищи", "загугли", "search", "интернет", "браузер", "google", "домен")
 PROMISE_PHRASES = ("сейчас поищу", "один момент", "подожди", "сейчас найду", "поищу ", "ищу ", "секунду", "минутку")
 WEB_TOOLS = {"web_search", "web_fetch"}
+PLANNER_CONFIRM_TOOLS = {"save_day_note", "add_plan_item", "add_schedule_event", "save_ideas"}
 
 TOOL_DESCRIPTIONS = {
     "save_user_fact": 'Сохранить факт о пользователе:\n    {"tool": "save_user_fact", "key": "ключ", "value": "значение"}',
@@ -47,10 +49,16 @@ class FloraBrain:
         self.browser = WebBrowserTool(self.db)
         self.files = FileTool(self.db)
         self._file_to_send: tuple[int, int] | None = None  # (user_id, file_id)
+        self._pending_save: dict | None = None
 
     def pop_file_to_send(self) -> tuple[int, int] | None:
         pending = self._file_to_send
         self._file_to_send = None
+        return pending
+
+    def pop_pending_save(self) -> dict | None:
+        pending = self._pending_save
+        self._pending_save = None
         return pending
 
     def _looks_like_search_request(self, text: str) -> bool:
@@ -219,15 +227,17 @@ class FloraBrain:
 План (add_plan_item) — нужны: название + plan_date. Спроси: «На какой день?» и «Во сколько напомнить?» (remind_at_time, например 09:00)
 
 Созвон/событие (add_schedule_event) — нужны: title + event_date + event_time (для созвонов).
-  Спроси «За сколько напомнить?» — пользователь выберет кнопкой (15/30/60/120 мин).
+  Спроси «За сколько напомнить?» если не указано (15/30/60/120 мин).
   Переводи ответы: «за час»=60, «за полчаса»=30, «за 15 минут»=15.
-  После успешного сохранения напиши коротко: «Готово ✅» и что именно записала.
 
-Напоминания с кнопками:
-- Если не хватает данных для напоминания — задай один вопрос формулировкой:
-  «Какое напоминание?» / «На какой день?» / «Во сколько?» / «За сколько напомнить?»
-- Пользователь ответит кнопкой — прими значение и двигайся дальше.
-- В конце всегда «Готово ✅» с кратким итогом.
+Подтверждение записи (ВАЖНО):
+- Когда все данные для заметки/плана/расписания/идей собраны — опиши что запишешь и вызови JSON-инструмент.
+- НЕ пиши «Записала», «Готово» — запись произойдёт только после кнопки «Да» у пользователя.
+- Заканчивай предложение: «Подтвердить?» или «Записать?»
+- Пример:
+  Запишу в план «купить молоко» на 2026-09-05, напомню в 09:00. Подтвердить?
+  {{"tool": "add_plan_item", "title": "купить молоко", "plan_date": "2026-09-05", "remind_at_time": "09:00"}}
+- Если пользователь нажал «Заменить» — спроси что изменить и предложи заново.
 
 Только когда пользователь ответил на все вопросы — вызывай инструмент с полными данными.
 
@@ -257,8 +267,8 @@ class FloraBrain:
 - Никогда не имитируй сохранение без инструмента.
 - Пример с вопросом (без JSON):
   Ок! На какой день добавить в план и за сколько напомнить?
-- Пример с действием:
-  Записала! ❤️
+- Пример с действием (ожидает подтверждения):
+  Запишу заметку на 2026-09-05: «созвон». Подтвердить?
   {{"tool": "save_day_note", "date": "2026-09-05", "content": "созвон"}}
 """
 
@@ -542,6 +552,22 @@ class FloraBrain:
 
                     clean_reply = reply.replace(tool_json_str, "").strip()
                     tool_name = tool_call.get("tool", "")
+
+                    if tool_name in PLANNER_CONFIRM_TOOLS:
+                        proposal = clean_reply or format_save_proposal(tool_call)
+                        if "подтверд" not in proposal.lower() and "записать" not in proposal.lower():
+                            proposal = proposal.rstrip() + "\n\nПодтвердить?"
+                        if is_group and chat_id:
+                            self.db.add_group_message(chat_id, "assistant", proposal)
+                        else:
+                            self.db.add_message(user_id, "assistant", proposal)
+                        self._pending_save = {
+                            "user_id": user_id,
+                            "tool": tool_name,
+                            "payload": tool_call,
+                        }
+                        return proposal
+
                     if clean_reply and not self._should_skip_intermediate(clean_reply, tool_name):
                         if is_group and chat_id:
                             self.db.add_group_message(chat_id, "assistant", clean_reply)

@@ -1,90 +1,60 @@
-"""Inline keyboards and wizard state for reminder setup."""
-from datetime import datetime, timedelta
+"""Inline confirm buttons for planner saves (notes, plans, schedule)."""
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-reminder_sessions: dict[int, dict] = {}
+pending_saves: dict[int, dict] = {}
 
 
-def kb_remind_type() -> InlineKeyboardMarkup:
+def kb_save_confirm() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📅 Созвон", callback_data="rw:type:call"),
-            InlineKeyboardButton(text="📋 Задача", callback_data="rw:type:plan"),
-        ],
-        [InlineKeyboardButton(text="✏️ Своё", callback_data="rw:type:custom")],
-    ])
-
-
-def kb_remind_date() -> InlineKeyboardMarkup:
-    today = datetime.now()
-    tomorrow = today + timedelta(days=1)
-    day2 = today + timedelta(days=2)
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="Сегодня", callback_data=f"rw:date:{today.strftime('%Y-%m-%d')}"),
-            InlineKeyboardButton(text="Завтра", callback_data=f"rw:date:{tomorrow.strftime('%Y-%m-%d')}"),
-        ],
-        [InlineKeyboardButton(text="Послезавтра", callback_data=f"rw:date:{day2.strftime('%Y-%m-%d')}")],
-    ])
-
-
-def kb_remind_time() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="09:00", callback_data="rw:time:09:00"),
-            InlineKeyboardButton(text="12:00", callback_data="rw:time:12:00"),
-            InlineKeyboardButton(text="15:00", callback_data="rw:time:15:00"),
-        ],
-        [
-            InlineKeyboardButton(text="18:00", callback_data="rw:time:18:00"),
-            InlineKeyboardButton(text="21:00", callback_data="rw:time:21:00"),
-            InlineKeyboardButton(text="Без времени", callback_data="rw:time:none"),
+            InlineKeyboardButton(text="✅ Да", callback_data="cf:yes"),
+            InlineKeyboardButton(text="❌ Нет", callback_data="cf:no"),
+            InlineKeyboardButton(text="✏️ Заменить", callback_data="cf:replace"),
         ],
     ])
 
 
-def kb_remind_before() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="15 мин", callback_data="rw:before:15"),
-            InlineKeyboardButton(text="30 мин", callback_data="rw:before:30"),
-        ],
-        [
-            InlineKeyboardButton(text="1 час", callback_data="rw:before:60"),
-            InlineKeyboardButton(text="2 часа", callback_data="rw:before:120"),
-        ],
-        [InlineKeyboardButton(text="Утром в 9:00", callback_data="rw:before:at:09:00")],
-    ])
+def store_pending(user_id: int, pending: dict):
+    pending_saves[user_id] = pending
 
 
-def kb_remind_confirm(title: str, date: str, time: str = None, before: str = None) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data="rw:confirm:yes"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="rw:confirm:no"),
-        ],
-    ])
+def get_pending(user_id: int) -> dict | None:
+    return pending_saves.get(user_id)
 
 
-def keyboard_for_flora_reply(text: str) -> InlineKeyboardMarkup | None:
-    lower = text.lower()
-    if "какое напоминание" in lower or "что напомнить" in lower:
-        return kb_remind_type()
-    if "на какой день" in lower:
-        return kb_remind_date()
-    if "во сколько" in lower:
-        return kb_remind_time()
-    if "за сколько напомнить" in lower or "за сколько напомн" in lower:
-        return kb_remind_before()
-    if "подтверд" in lower or "всё верно" in lower or "все верно" in lower or "проверь" in lower:
-        return kb_remind_confirm("", "", None, None)
-    return None
+def clear_pending(user_id: int):
+    pending_saves.pop(user_id, None)
 
 
-def start_session(user_id: int) -> dict:
-    reminder_sessions[user_id] = {"step": "type", "kind": None, "title": None, "date": None, "time": None, "before": None}
-    return reminder_sessions[user_id]
-
-
-def get_session(user_id: int) -> dict | None:
-    return reminder_sessions.get(user_id)
+def format_save_proposal(tool_call: dict) -> str:
+    tool = tool_call.get("tool")
+    if tool == "save_day_note":
+        date = tool_call.get("date") or tool_call.get("note_date") or "?"
+        content = tool_call.get("content", "")
+        return f"📝 Заметка на {date}:\n{content}"
+    if tool == "add_plan_item":
+        title = tool_call.get("title", "")
+        date = tool_call.get("plan_date") or "без даты"
+        lines = [f"📋 План: {title}", f"День: {date}"]
+        if tool_call.get("remind_at_time"):
+            lines.append(f"Напомню в {tool_call['remind_at_time']}")
+        if tool_call.get("description"):
+            lines.append(tool_call["description"])
+        return "\n".join(lines)
+    if tool == "add_schedule_event":
+        title = tool_call.get("title", "")
+        date = tool_call.get("event_date") or "?"
+        time = tool_call.get("event_time")
+        mins = tool_call.get("remind_minutes_before") or 30
+        lines = [f"📅 {title}", f"Дата: {date}"]
+        if time:
+            lines.append(f"Время: {time}")
+        lines.append(f"Напомню за {mins} мин")
+        return "\n".join(lines)
+    if tool == "save_ideas":
+        topic = tool_call.get("topic", "общее")
+        ideas = tool_call.get("ideas") or []
+        date = tool_call.get("date") or "сегодня"
+        body = "\n".join(f"{i + 1}. {idea}" for i, idea in enumerate(ideas))
+        return f"💡 Идеи ({topic}) на {date}:\n{body}"
+    return "Записать?"
