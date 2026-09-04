@@ -197,7 +197,8 @@ async def process_flora_reply(owner_id: int, user_text: str, sender_name: str, c
     if not reply_text or reply_text.strip() in ("", "_skip_"):
         return
 
-    reply_text = FloraBrain.humanize_reply(reply_text)
+    if not brain.pop_skip_humanize():
+        reply_text = FloraBrain.humanize_reply(reply_text)
     flora_sessions.touch(user_id, owner_id, sender_name)
 
     pending_save = brain.pop_pending_save()

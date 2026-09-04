@@ -57,4 +57,4 @@ def format_save_proposal(tool_call: dict) -> str:
         date = tool_call.get("date") or "сегодня"
         body = "\n".join(f"{i + 1}. {idea}" for i, idea in enumerate(ideas))
         return f"💡 Идеи ({topic}) на {date}:\n{body}"
-    return "Записать?"
+    return "записать"

@@ -52,6 +52,12 @@ class FloraBrain:
         self.files = FileTool(self.db)
         self._file_to_send: tuple[int, int] | None = None  # (user_id, file_id)
         self._pending_save: dict | None = None
+        self._skip_humanize: bool = False
+
+    def pop_skip_humanize(self) -> bool:
+        skip = self._skip_humanize
+        self._skip_humanize = False
+        return skip
 
     def pop_file_to_send(self) -> tuple[int, int] | None:
         pending = self._file_to_send
@@ -143,15 +149,29 @@ class FloraBrain:
         return "Контексты и память проекта:\n" + "\n".join(lines)
 
     @staticmethod
-    def humanize_reply(text: str) -> str:
+    def humanize_reply(text: str, casual: bool = True) -> str:
         if not text or not text.strip():
             return text
+        if not casual:
+            return text.strip()
         t = text.strip()
-        if t[0].isupper() and len(t) > 1 and t[1].islower():
-            t = t[0].lower() + t[1:]
-        for phrase in ("Конечно!", "Разумеется!", "Я помогу", "Я могу", "Как ИИ", "Как языковая модель"):
+        for phrase in (
+            "Конечно!", "Разумеется!", "Я помогу", "Я могу", "Как ИИ", "Как языковая модель",
+            "Буду рада", "С удовольствием", "Я записала", "Я добавила",
+        ):
             t = t.replace(phrase, "")
-        return t.strip()
+        lines = []
+        for line in t.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if line[:4].upper() == "АХАХ":
+                lines.append(line)
+                continue
+            if line[0].isupper() and len(line) > 1 and line[1].islower():
+                line = line[0].lower() + line[1:]
+            lines.append(line)
+        return " ".join(lines) if len(lines) <= 3 else "\n".join(lines)
 
     def _personality_block(self) -> str:
         return """
@@ -164,6 +184,26 @@ class FloraBrain:
 - Иногда вклиниваешься в чужой разговор — одной репликой, без лекций.
 - Если просят запомнить контекст — уточни что именно, потом save_chat_context.
 - Контексты используй в ответах: помни про проект, договорённости, прошлые темы чата.
+"""
+
+    def _chat_style_block(self) -> str:
+        return """
+Стиль переписки в чате (это НЕ анализ и НЕ отчёт):
+- пиши как живой человек в телеге: обрывки, куски, без развёрнутых предложений
+- примеры: «ща гляну», «ок», «пон», «ну такое», «лол нет», «запишу завтра в 9»
+- всё с маленькой буквы (кроме АХАХ, имён, аббревиатур)
+- 1–3 коротких фразы max, не абзацы
+- НЕ заканчивай сообщения вопросом. не «норм?», не «а ты?», не «что думаешь?» — просто ответь или отреагируй
+- вопрос — только если без него нельзя выполнить действие (нет даты/текста для записи). и то коротко, без допроса
+- запрещено: «Конечно, я помогу вам с этим вопросом» — нужно: «ща, сек»
+"""
+
+    def _analysis_style_block(self) -> str:
+        return """
+Стиль анализа и отчётов (файлы, поиск, дайджест, таблицы):
+- нормальные предложения, можно с большой буквы
+- структура: вывод, факты, цифры, пункты
+- без токсичного сленга, по делу
 """
 
     def _get_system_prompt(self, user_id: int, is_group: bool = False, chat_title: str = None, chat_id: int = None) -> str:
@@ -183,7 +223,7 @@ class FloraBrain:
 Групповой чат:
 - Ты в групповом Telegram-чате{" '" + chat_title + "'" if chat_title else ""}.
 - Отвечай лаконично. Заметки, планы и расписание — у владельца (того, кто тебя добавил).
-- Если просят «запиши заметку», «добавь в план», «запланируй созвон» — сначала убедись что есть все данные; если чего-то нет — спроси, не вызывай инструмент.
+- Если просят «запиши заметку», «добавь в план», «запланируй созвон» — сначала убедись что есть все данные; если чего-то нет — скажи чего не хватает (без допроса), не вызывай инструмент.
 - Созвоны и встречи — через add_schedule_event (обязательно укажи event_time, например 14:00).
 - Задачи на день — через add_plan_item с plan_date.
 - Напоминания о планах и созвонах Flora автоматически шлёт сюда в группу.
@@ -199,6 +239,7 @@ class FloraBrain:
 
         return f"""Ты — Flora, токсичная зумер-секретарша в Telegram-чате проекта.
 {self._personality_block()}
+{self._chat_style_block() if is_group else ""}
 Твои задачи (делай их, но в своём стиле):
 - Вести заметки на конкретные дни (save_day_note) — когда просят «запиши заметку», «сохрани на завтра».
 - Управлять планами (add_plan_item, list_plan_items, complete_plan_item).
@@ -216,14 +257,14 @@ class FloraBrain:
 - «запиши идеи» / «сохрани идеи» → save_ideas (или save_day_note)
 - «найди в интернете» / «поищи» / «загугли» / «search» → web_search (реальный браузер), затем web_fetch если нужны детали
 - «посмотри сайт» / «проанализируй» / «вытащи инфу» → web_fetch (если есть URL)
-- «запомни контекст» / «запомни про проект» / «сохрани что мы решили» → save_chat_context (если мало инфы — спроси)
+- «запомни контекст» / «запомни про проект» / «сохрани что мы решили» → save_chat_context (если мало инфы — попроси дописать, без допроса)
 - «какие контексты» / «что помнишь про X» → list_chat_contexts или ответ из памяти
 
 - «прочитай файл» / «что в файле» / «список файлов» / «сохрани в файл» / «удали файл» → list_user_files, read_user_file, write_user_file, delete_user_file
 
 Контексты проекта:
 - save_chat_context — когда просят запомнить тему, проект, договорённости. name = короткое название.
-- Если инфы мало — задай один уточняющий вопрос, потом сохрани.
+- Если инфы мало — одна короткая фраза что дописать, потом сохрани.
 - append: true — дописать к существующему контексту.
 - list_chat_contexts — показать все сохранённые блоки памяти.
 
@@ -243,14 +284,14 @@ class FloraBrain:
 - Перед поиском не болтай — либо сразу JSON без текста, либо одно слово «Сек» + JSON.
 - После web_search ОБЯЗАТЕЛЬНО дай пользователю результат: топ ссылок и краткий ответ. Не останавливайся на обещании.
 - Если нужны детали — второй вызов web_fetch, потом полный фидбек.
-- Если запрос размытый — один короткий вопрос БЕЗ обещания поиска.
+- Если запрос размытый — одна короткая фраза что уточнить, БЕЗ обещания поиска.
 
 Анализ сайтов (ВАЖНО):
 - Если дали URL — сначала web_fetch, потом на основе текста страницы дай фидбек.
 - Фидбек строй строго под запрос пользователя: цены, контакты, pros/cons, summary, конкуренты — что попросили.
 - Структурируй ответ: краткий вывод в начале, потом пункты с фактами с сайта.
 - Не выдумывай — только то, что реально есть в результате web_fetch. Если данных нет на странице — скажи честно.
-- Если URL не дали — web_search по теме или спроси ссылку.
+- Если URL не дали — web_search по теме или попроси ссылку одной фразой.
 - По просьбе сохрани вывод в заметку (save_day_note) или идеи (save_ideas).
 
 Сленг и стиль:
@@ -265,13 +306,14 @@ class FloraBrain:
 - Если просят «ещё» или «другие» — предложи новые, не повторяй старые.
 - Если понравилась идея и просят сохранить — save_ideas или add_plan_item.
 
-Уточняющие вопросы (ВАЖНО):
-- Если для действия не хватает данных — задай ОДИН короткий вопрос и НЕ вызывай инструмент в этом сообщении.
+Если не хватает данных для действия:
+- Только когда без этого нельзя записать/сохранить — одна короткая фраза чего не хватает. БЕЗ JSON в этом сообщении.
 - Не угадывай и не додумывай за пользователя то, что он не сказал.
+- Не допрашивай ради общения — вопросы только по делу.
 
-Заметка (save_day_note) — нужны: текст заметки + дата. Спроси: «На какой день записать?» или «Что записать?»
+Заметка (save_day_note) — нужны: текст + дата. Если нет — «напиши текст» или «напиши день».
 
-План (add_plan_item) — нужны: название + plan_date. Спроси: «На какой день?» и «Во сколько напомнить?» (remind_at_time, например 09:00)
+План (add_plan_item) — нужны: название + plan_date. Если нет — «напиши день» / «напиши время напоминания» (remind_at_time, например 09:00)
 
 Созвон/событие (add_schedule_event) — нужны: title + event_date + event_time (для созвонов).
   Если не указано «за сколько напомнить» — remind_minutes_before = 15 (по умолчанию).
@@ -280,20 +322,22 @@ class FloraBrain:
 Подтверждение записи (ВАЖНО):
 - Когда все данные для заметки/плана/расписания/идей собраны — опиши что запишешь и вызови JSON-инструмент.
 - НЕ пиши «Записала», «Готово» — запись произойдёт только после кнопки «Да» у пользователя.
-- Заканчивай предложение: «Подтвердить?» или «Записать?»
-- Пример:
-  Запишу в план «купить молоко» на 2026-09-05, напомню в 09:00. Подтвердить?
+- кнопки Да/Нет/Заменить покажутся сами — НЕ добавляй «подтвердить?» и не заканчивай вопросом
+- пример:
+  запишу в план «купить молоко» на 2026-09-05, напомню в 09:00
   {{"tool": "add_plan_item", "title": "купить молоко", "plan_date": "2026-09-05", "remind_at_time": "09:00"}}
-- Если пользователь нажал «Заменить» — спроси что изменить и предложи заново.
+- Если пользователь нажал «Заменить» — попроси что изменить и предложи заново.
 
 Только когда пользователь ответил на все вопросы — вызывай инструмент с полными данными.
 
-Правила общения:
-- Коротко. Без markdown. Без *действий* в звёздочках.
-- С маленькой буквы. Не как бот-помощник из рекламы.
-- Эмодзи редко.
-- Когда все данные есть — вызывай инструмент.
-- Даты YYYY-MM-DD.
+Правила общения в чате:
+- обрывки, не развёрнутые предложения. как в переписке, не как статья.
+- с маленькой буквы. без markdown. без *действий*.
+- эмодзи редко.
+- не заканчивай вопросом — утверждение, реакция, факт. вопрос только если без него нельзя выполнить запрос.
+- когда все данные есть — вызывай инструмент.
+- даты YYYY-MM-DD.
+- результат web_search / web_fetch — это анализ: там можно нормальные предложения и большие буквы.
 {group_context}
 Память о пользователе:
 {user_facts_str}
@@ -311,12 +355,12 @@ class FloraBrain:
 
 Правила вызова:
 - Если данных достаточно — короткий ответ + JSON-блок в конце.
-- Если данных не хватает — только вопрос, БЕЗ JSON-блока.
+- Если данных не хватает — одна фраза чего не хватает, БЕЗ JSON-блока. без вопросительного знака в конце если можно.
 - Никогда не имитируй сохранение без инструмента.
-- Пример с вопросом (без JSON):
-  Ок! На какой день добавить в план и за сколько напомнить?
-- Пример с действием (ожидает подтверждения):
-  Запишу заметку на 2026-09-05: «созвон». Подтвердить?
+- Пример без данных (без JSON):
+  напиши день и время напоминания
+- Пример с действием (кнопки подтверждения сами):
+  заметка на 2026-09-05: «созвон»
   {{"tool": "save_day_note", "date": "2026-09-05", "content": "созвон"}}
 """
 
@@ -559,13 +603,14 @@ class FloraBrain:
 - Отвечай на русском, по делу, без markdown-таблиц (списки и абзацы).
 - Только факты из файла, ничего не выдумывай.
 - Если таблица — разбор столбцов, цифры, итоги, выводы.
-- Если обычный текст/документ — суть и ключевые значения."""
+- Если обычный текст/документ — суть и ключевые значения.
+{self._analysis_style_block()}"""
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         messages = [
             {
                 "role": "system",
-                "content": self._get_system_prompt(user_id, is_group=True, chat_title=chat_title, chat_id=chat_id),
+                "content": "Ты Flora — аналитик. " + self._analysis_style_block(),
             },
             {"role": "user", "content": analysis_prompt},
         ]
@@ -637,9 +682,9 @@ no — сообщение для других людей, оффтоп, болт
             f"{m['sender_name']}: {m['content'][:100]}" for m in chat_log[-40:]
         ) if chat_log else "(тишина)"
 
-        instruction = f"""Сделай дайджест дня для проекта в стиле токсичной зумер-секретарши Flora.
+        instruction = f"""Сделай дайджест дня для проекта.
 Дата: {today}
-С маленькой буквы, коротко, 5–10 строк max, эмодзи 0–1.
+{self._analysis_style_block()}
 
 Чат за день:
 {chat_sample}
@@ -659,14 +704,14 @@ no — сообщение для других людей, оффтоп, болт
                     json={
                         "model": self.model,
                         "messages": [
-                            {"role": "system", "content": self._get_system_prompt(user_id, is_group=True, chat_id=chat_id) + self._personality_block()},
+                            {"role": "system", "content": "Ты Flora. " + self._analysis_style_block()},
                             {"role": "user", "content": instruction},
                         ],
-                        "temperature": 0.6,
+                        "temperature": 0.5,
                     },
                 )
                 response.raise_for_status()
-                reply = self.humanize_reply(response.json()["choices"][0]["message"]["content"].strip())
+                reply = response.json()["choices"][0]["message"]["content"].strip()
                 self.db.add_group_message(chat_id, "assistant", reply)
                 return reply
         except Exception as e:
@@ -690,9 +735,12 @@ no — сообщение для других людей, оффтоп, болт
         else:
             self.db.add_message(user_id, "user", user_message)
 
+        self._skip_humanize = False
+        web_tools_used = False
+
         max_iterations = 1 if banter_mode else 6
         banter_extra = (
-            "\n[Вклинивание]: сообщение не к тебе напрямую. одна короткая реплика (1–2 предложения), "
+            "\n[Вклинивание]: сообщение не к тебе напрямую. одна короткая реплика-обрывок, "
             "подкол/реакция/сарказм. БЕЗ JSON-инструментов. если нечего сказать — напиши ровно: _skip_"
         ) if banter_mode else ""
 
@@ -782,6 +830,8 @@ no — сообщение для других людей, оффтоп, болт
                         else:
                             self.db.add_message(user_id, "assistant", reply)
                         asyncio.create_task(self.auto_learn_from_turn(user_id, user_message, reply))
+                        if had_web_result or web_tools_used:
+                            self._skip_humanize = True
                         return reply
 
                     try:
@@ -802,8 +852,6 @@ no — сообщение для других людей, оффтоп, болт
 
                     if tool_name in PLANNER_CONFIRM_TOOLS:
                         proposal = clean_reply or format_save_proposal(tool_call)
-                        if "подтверд" not in proposal.lower() and "записать" not in proposal.lower():
-                            proposal = proposal.rstrip() + "\n\nПодтвердить?"
                         if is_group and chat_id:
                             self.db.add_group_message(chat_id, "assistant", proposal)
                         else:
@@ -824,6 +872,8 @@ no — сообщение для других людей, оффтоп, болт
                             await on_intermediate_response(clean_reply)
 
                     tool_result = await self.execute_tool(tool_call, user_id)
+                    if tool_name in WEB_TOOLS:
+                        web_tools_used = True
 
                     if is_group and chat_id:
                         self.db.add_group_message(chat_id, "system", f"[Результат {tool_call['tool']}]: {tool_result}")
@@ -838,8 +888,9 @@ no — сообщение для других людей, оффтоп, болт
                         final_messages = [{
                             "role": "system",
                             "content": self._get_system_prompt(user_id, is_group=is_group, chat_title=chat_title, chat_id=chat_id)
-                            + "\nИнструменты отключены. Дай полный ответ пользователю по его запросу. "
-                            "Если был web_search или web_fetch — обязательно перечисли результаты и вывод. "
+                            + self._analysis_style_block()
+                            + "\nИнструменты отключены. Дай полный ответ по запросу (это результат поиска/анализа). "
+                            "Нормальные предложения, можно с большой буквы. Перечисли результаты и вывод. "
                             "Не пиши «ищу» или «момент» — только готовый результат."
                         }]
                         for msg in final_history:
@@ -858,6 +909,7 @@ no — сообщение для других людей, оффтоп, болт
                             else:
                                 self.db.add_message(user_id, "assistant", final_reply)
                             asyncio.create_task(self.auto_learn_from_turn(user_id, user_message, final_reply))
+                            self._skip_humanize = True
                             return final_reply
 
             except Exception as e:
